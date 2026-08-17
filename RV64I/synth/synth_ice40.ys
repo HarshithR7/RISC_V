@@ -1,0 +1,12 @@
+read_verilog -sv program_counter.v
+read_verilog -sv instruction_fetch.v
+read_verilog -sv compressed_decoder.v
+read_verilog -sv decode_control_unit.v
+read_verilog -sv register_file.v
+read_verilog -sv vector_register_file.v
+read_verilog -sv vector_alu.v
+read_verilog -sv execute.v
+read_verilog -sv data_memory.v
+read_verilog -sv riscv64_proc_synth.v
+synth_ice40 -top riscv64_processor_synth -json riscv64_synth.json
+stat
