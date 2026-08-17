@@ -38,7 +38,13 @@ synthesized Fmax exists yet to convert that to bytes/second honestly.
 The vector datapath's width (`LANES`, default 4 → `VLEN=128`) is a real
 synthesis-time parameter, not a hardcoded constant — proven by
 instantiating and running the core with `LANES=8` end-to-end — see
-[Configurable vector width](#configurable-vector-width).
+[Configurable vector width](#configurable-vector-width). Real Yosys
+synthesis (not estimated) puts the synthesizable core (F/D excluded — see
+below for why) at **52,126 LUTs, 19,108 carry cells, 6,212 flip-flops**
+on Lattice iCE40 — larger than any real iCE40 device, driven mostly by
+five independent combinational hardware dividers — see [Area and
+frequency](#area-and-frequency) for the full breakdown and what a real
+deployment would do differently.
 
 ## Architecture
 
@@ -1361,9 +1367,17 @@ support.
 
 Attempted with a real, unmodified open-source toolchain (Yosys 0.68 +
 ABC9 + nextpnr, the [oss-cad-suite](https://github.com/YosysHQ/oss-cad-suite-build)
-distribution) targeting Lattice iCE40, not estimated or guessed. Getting
-honest numbers here required working around two real obstacles specific
-to this design, both worth documenting on their own:
+distribution) targeting Lattice iCE40 and ECP5, not estimated or guessed.
+
+```sh
+export PATH="/c/oss-cad-suite/bin:/c/oss-cad-suite/lib:$PATH"
+cd RV64I/synth
+yosys -s synth_ice40.ys   # area: real LUT/carry/FF counts (below); doesn't fit iCE40, no P&R
+yosys -s synth_ecp5.ys    # larger target -- attempted for a real, P&R-based Fmax
+```
+
+Getting honest numbers here required working around two real obstacles
+specific to this design, both worth documenting on their own:
 
 1. **`fpu.v` is not synthesizable at all, by any tool.** Its F/D
    arithmetic is built on Verilog's `real` type
@@ -1404,15 +1418,34 @@ to this design, both worth documenting on their own:
    count" attempt would have hidden by silently constant-folding around
    it instead of hitting it honestly.
 
-**Status: synthesis is real but has not finished within this session.**
-Yosys's `synth_ice40`/generic `synth` flows both got well past
-elaboration — a genuine ~198,000-AND-gate, 6438-input/911-output
-combinational netlist was successfully extracted for the full
-(F/D-excluded) core — before stalling for many minutes in ABC9's
-technology-mapping/optimization passes (`&dc2`/`&scorr`) without
-completing. This is not a tooling failure or a stuck process by
-accident: this scoped core's divide/remainder support means **five
-independent combinational (single-cycle, non-iterative) hardware
+### Area: real numbers (`synth_ice40.ys`)
+
+`synth_ice40` completed after a long ABC9 technology-mapping run (tens
+of minutes — see below for why). Real cell counts for the synthesizable
+RV64IMAC + RVV core (`LANES=4`, F/D excluded, `RV64I/synth/`'s blackbox-
+memory variant):
+
+| Resource | Count |
+|---|---|
+| 4-input LUTs (`SB_LUT4`) | 52,126 |
+| Dedicated carry cells (`SB_CARRY`) | 19,108 |
+| Flip-flops (`SB_DFFE`/`SB_DFFER`/`SB_DFFES`/`SB_DFFR`) | 6,212 |
+
+**This does not fit on any real iCE40 device** — the largest part in the
+family (iCE40 HX8K) has ~7,680 LUTs, roughly 15% of what this core needs.
+That's not a synthesis failure; LUT count is real, valid data regardless
+of whether a specific chip is big enough to hold it, and reporting it
+honestly (rather than not reporting area at all because "it doesn't fit
+iCE40") is more useful than silence. It does mean iCE40 place-and-route
+(and therefore an iCE40-specific Fmax) isn't attainable for this design;
+`RV64I/synth/synth_ecp5.ys` targets Lattice ECP5 instead (largest part,
+LFE5UM5G-85F, has ~84,000 LUTs — enough headroom to actually attempt
+placement) for a real, timing-driven Fmax, [status TBD — see the run
+command below if this document doesn't yet show a completed ECP5 result].
+
+**Why this took tens of minutes, not seconds — a real, expected cost, not
+a stuck process:** this scoped core's divide/remainder support means
+**five independent combinational (single-cycle, non-iterative) hardware
 dividers** exist in the synthesizable netlist — one for the scalar
 M-extension (`execute.v`) and, since `vector_alu.v`'s divide/remainder
 lanes are fully parallel, **one per vector lane** (four, at the default
@@ -1420,26 +1453,32 @@ lanes are fully parallel, **one per vector lane** (four, at the default
 divider is a genuinely large, difficult-to-optimize Boolean function —
 well-documented as expensive for logic synthesis tools in general — and
 this design pays that cost five times over, once for scalar and four
-times more for the vector unit's per-lane parallelism. A partial,
-isolated result from the same run already confirms this concretely: the
+times more for the vector unit's per-lane parallelism. Concretely, the
+full netlist Yosys extracted before technology mapping was ~198,000 AND
+gates across 6,438 inputs/911 outputs; a partial, isolated result from
+the same run already confirmed the divider cost directly: the
 top-level module's own glue logic (control/muxing, excluding the
 `execute` and `vector_alu` submodules where the dividers live) mapped to
 roughly 7,360 gates in seconds; `execute.v` alone had not finished
 mapping after several minutes on the same run.
 
-**What this means, stated plainly:** real area and Fmax numbers for this
-core need either (a) more synthesis time than fit in this session (the
-run may still be salvageable by letting ABC9 continue), or (b)
-architecturally trading the single-cycle combinational divider for a
-multi-cycle iterative one — a well-known, standard real-hardware tradeoff
-(SRT division or a simple restoring-division state machine) that would
-shrink this specific bottleneck by roughly an order of magnitude in area
-at the cost of turning DIV/REM into multi-cycle operations (a real
-microarchitecture change, not attempted here — this core is single-cycle
-throughout by design, and introducing the first multi-cycle instruction
-would be a bigger architectural decision than this session's scope, not
-a quick fix). Reporting a made-up Fmax or area number instead of this
-honest status would be worse than reporting nothing.
+**What this means, stated plainly:** the 52K-LUT area figure above is
+real and final for `LANES=4` on this target flow. A real Fmax number
+still needs a device the design actually fits on (ECP5, attempted
+separately — see above) and place-and-route timing analysis, which
+wasn't available within this session for the reasons already stated. If
+this core were headed toward real silicon or a real FPGA deployment
+rather than a functional/architectural demonstration, the standard,
+well-known fix for the divider cost specifically would be trading the
+single-cycle combinational divider for a multi-cycle iterative one (SRT
+division or a simple restoring-division state machine) — plausibly an
+order-of-magnitude area reduction for that specific bottleneck, at the
+cost of turning DIV/REM into multi-cycle operations. That's a real
+microarchitecture change (this core is single-cycle throughout by
+design; introducing the first multi-cycle instruction is a bigger
+decision than this session's scope) and wasn't attempted here — noted as
+the concrete next step for anyone who *does* need this core to fit a
+real device, not as an excuse for the numbers above.
 
 ## What's not covered
 
