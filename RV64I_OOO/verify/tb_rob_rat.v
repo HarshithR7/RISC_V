@@ -32,11 +32,14 @@ module tb_rob_rat;
         .clk(clk), .reset(reset),
         .alloc_req(alloc_req), .alloc_has_dest(alloc_has_dest), .alloc_rd(alloc_rd),
         .alloc_is_store(alloc_is_store), .alloc_is_ecall(alloc_is_ecall),
+        .alloc_is_vec_dest(1'b0),
         .alloc_tag(alloc_tag), .full(full), .empty(empty),
         .alloc2_req(1'b0), .alloc2_has_dest(1'b0), .alloc2_rd(5'b0),
-        .alloc2_is_store(1'b0), .alloc2_is_ecall(1'b0),
+        .alloc2_is_store(1'b0), .alloc2_is_ecall(1'b0), .alloc2_is_vec_dest(1'b0),
         .alloc2_tag(), .free_count(),
         .mark_valid(mark_valid), .mark_tag(mark_tag), .mark_value(mark_value),
+        .mark_b_valid(1'b0), .mark_b_tag({TB{1'b0}}), .mark_b_value(64'b0),
+        .vec_mark_valid(1'b0), .vec_mark_tag({TB{1'b0}}), .vec_mark_value(128'b0),
         .mark2_valid(1'b0), .mark2_tag({TB{1'b0}}),
         .extra_mark_valid(4'b0), .extra_mark_tag_flat(12'b0),
         .squash_valid(1'b0), .squash_tag({TB{1'b0}}),
@@ -44,10 +47,16 @@ module tb_rob_rat;
         .lookup2_tag({TB{1'b0}}), .lookup2_done(), .lookup2_value(),
         .lookup3_tag({TB{1'b0}}), .lookup3_done(), .lookup3_value(),
         .lookup4_tag({TB{1'b0}}), .lookup4_done(), .lookup4_value(),
+        .vec_lookup1_tag({TB{1'b0}}), .vec_lookup1_done(), .vec_lookup1_value(),
+        .vec_lookup2_tag({TB{1'b0}}), .vec_lookup2_done(), .vec_lookup2_value(),
         .head_ready(head_ready), .head_tag(head_tag), .head_has_dest(head_has_dest),
         .head_rd(head_rd), .head_value(head_value),
+        .head_vec_value(), .head_is_vec_dest(),
         .head_is_store(head_is_store), .head_is_ecall(head_is_ecall),
-        .commit_req(commit_req)
+        .commit_req(commit_req),
+        .head2_ready(), .head2_tag(), .head2_has_dest(), .head2_rd(), .head2_value(),
+        .head2_vec_value(), .head2_is_vec_dest(),
+        .head2_is_store(), .head2_is_ecall(), .commit_req2(1'b0)
     );
 
     // ---- RAT ----
@@ -71,6 +80,7 @@ module tb_rob_rat;
         .write_en(write_en), .rd(wr_rd), .new_tag(wr_tag),
         .write2_en(1'b0), .rd2(5'b0), .new_tag2({TB{1'b0}}),
         .commit_clear_en(commit_clear_en), .commit_rd(commit_rd), .commit_tag(commit_tag),
+        .commit_clear_en2(1'b0), .commit_rd2(5'b0), .commit_tag2({TB{1'b0}}),
         .checkpoint_save(1'b0), .checkpoint_restore(1'b0)
     );
 

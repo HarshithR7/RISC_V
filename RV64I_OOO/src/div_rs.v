@@ -16,6 +16,7 @@ module div_rs #(
     input reset,
 
     input alloc_req,
+    input alloc_tid,
     input [2:0] alloc_op,        // muldiv_op: 100=DIV 101=DIVU 110=REM 111=REMU
     input alloc_word_op,
     input alloc_src1_ready,
@@ -27,24 +28,44 @@ module div_rs #(
     input [TAG_BITS-1:0] alloc_dest_tag,
     output full,
 
-    input cdb_valid,
-    input [TAG_BITS-1:0] cdb_tag,
-    input [63:0] cdb_value,
+    // Two independent CDB snoop buses -- see alu_rs.v's identical port,
+    // including cdbA_tid/cdbB_tid (Phase 7 fix: ROB tags are only unique
+    // per-thread, so snoop matching must compare the full (tid,tag) pair,
+    // not the tag alone).
+    input cdbA_valid,
+    input cdbA_tid,
+    input [TAG_BITS-1:0] cdbA_tag,
+    input [63:0] cdbA_value,
+    input cdbB_valid,
+    input cdbB_tid,
+    input [TAG_BITS-1:0] cdbB_tag,
+    input [63:0] cdbB_value,
 
     output req_valid,
+    output req_tid,
     output [TAG_BITS-1:0] req_tag,
     output [63:0] req_value,
     input req_grant,
 
-    // Phase 2 misprediction squash -- same convention as alu_rs.v, but
-    // with one extra wrinkle: div_fu itself has no abort input, so a
-    // squash while it's mid-computation can't stop it, only disown its
+    // Phase 7 (SMT): one head tag per thread -- see alu_rs.v's header.
+    // No issue-priority logic is needed here (single entry, nothing to
+    // arbitrate among), just the tid tag itself and thread-aware squash.
+    input [TAG_BITS-1:0] rob_head_tag0,
+    input [TAG_BITS-1:0] rob_head_tag1,
+
+    // Phase 2 misprediction squash, now two independent per-thread ports
+    // (Phase 7) -- see alu_rs.v's header for why a single muxed port can't
+    // handle both threads mispredicting in the same cycle. One extra
+    // wrinkle unchanged from before: div_fu itself has no abort input, so
+    // a squash while it's mid-computation can't stop it, only disown its
     // eventual result (see the `full` comment below).
-    input [TAG_BITS-1:0] rob_head_tag,
-    input squash_valid,
-    input [TAG_BITS-1:0] squash_tag
+    input squash0_valid,
+    input [TAG_BITS-1:0] squash0_tag,
+    input squash1_valid,
+    input [TAG_BITS-1:0] squash1_tag
 );
     reg busy;
+    reg tid_r;
     reg [2:0] op;
     reg word_op_r;
     reg s1_ready; reg [63:0] s1_val; reg [TAG_BITS-1:0] s1_tag;
@@ -64,13 +85,6 @@ module div_rs #(
     // reallocation until that stale completion has nowhere left to land.
     assign full = busy || div_busy_w;
 
-    function [TAG_BITS-1:0] age;
-        input [TAG_BITS-1:0] t;
-        begin
-            age = t - rob_head_tag;
-        end
-    endfunction
-
     wire is_signed_op  = !op[0];   // DIV/REM = signed, DIVU/REMU = unsigned
     wire is_remainder   = op[1];    // REM/REMU vs DIV/DIVU
     wire operands_ready = s1_ready && s2_ready;
@@ -89,6 +103,7 @@ module div_rs #(
     );
 
     assign req_valid = busy && have_result;
+    assign req_tid   = tid_r;
     assign req_tag   = dest_tag;
     assign req_value = is_remainder ? result_r : result_q;
 
@@ -98,17 +113,20 @@ module div_rs #(
             started <= 1'b0;
             have_result <= 1'b0;
         end else begin
-            if (cdb_valid) begin
-                if (busy && !s1_ready && s1_tag == cdb_tag) begin
-                    s1_ready <= 1'b1; s1_val <= cdb_value;
-                end
-                if (busy && !s2_ready && s2_tag == cdb_tag) begin
-                    s2_ready <= 1'b1; s2_val <= cdb_value;
-                end
+            if (busy && !s1_ready && cdbA_valid && tid_r == cdbA_tid && s1_tag == cdbA_tag) begin
+                s1_ready <= 1'b1; s1_val <= cdbA_value;
+            end else if (busy && !s1_ready && cdbB_valid && tid_r == cdbB_tid && s1_tag == cdbB_tag) begin
+                s1_ready <= 1'b1; s1_val <= cdbB_value;
+            end
+            if (busy && !s2_ready && cdbA_valid && tid_r == cdbA_tid && s2_tag == cdbA_tag) begin
+                s2_ready <= 1'b1; s2_val <= cdbA_value;
+            end else if (busy && !s2_ready && cdbB_valid && tid_r == cdbB_tid && s2_tag == cdbB_tag) begin
+                s2_ready <= 1'b1; s2_val <= cdbB_value;
             end
 
             if (alloc_req && !busy) begin
                 busy       <= 1'b1;
+                tid_r      <= alloc_tid;
                 op         <= alloc_op;
                 word_op_r  <= alloc_word_op;
                 s1_ready   <= alloc_src1_ready;
@@ -136,9 +154,12 @@ module div_rs #(
                 busy <= 1'b0;
             end
 
-            if (squash_valid && busy && age(dest_tag) > age(squash_tag)) begin
+            if (squash0_valid && busy && !tid_r &&
+                (dest_tag - rob_head_tag0) > (squash0_tag - rob_head_tag0))
                 busy <= 1'b0;
-            end
+            if (squash1_valid && busy && tid_r &&
+                (dest_tag - rob_head_tag1) > (squash1_tag - rob_head_tag1))
+                busy <= 1'b0;
         end
     end
 endmodule

@@ -35,7 +35,35 @@ module decode_ooo (
     // (0 for LUI, the current PC for AUIPC) and `rs1` above must be
     // ignored for dependency-tracking purposes.
     output reg src1_is_zero,    // LUI: operand1 = 0 (result = 0 + imm = imm)
-    output reg src1_is_pc       // AUIPC: operand1 = pc
+    output reg src1_is_pc,      // AUIPC: operand1 = pc
+
+    // Phase 6 (DLP): scoped RVV decode -- .vv-form elementwise
+    // arithmetic/logic/min-max/shift/divide only (VADD..VSRA in
+    // vector_alu.v's op encoding). Deliberately excludes, and never sets
+    // is_vec for: .vx/.vi forms (would need a scalar/immediate operand
+    // path into the vector datapath -- a genuine cross-domain dependency
+    // this scoped integration avoids entirely), compares (mask-shaped
+    // results), reductions (a fold, not an elementwise op -- different
+    // execution model), vsetvli (no vl/vtype state tracked -- vl is
+    // implicitly fixed at VLMAX=LANES), and vector load/store (no vector
+    // LSQ integration). vs1/vs2/vd reuse the same rs1/rs2/rd outputs
+    // above -- RVV's operand fields sit at the identical instruction bit
+    // positions as the scalar ISA's, so no separate vs1/vs2/vd ports are
+    // needed.
+    output reg is_vec,
+    output reg [4:0] v_op,
+
+    // vmv.v.x (broadcast scalar rs1 into all vector lanes, real RVV
+    // encoding) -- added specifically to make the vector pipeline
+    // testable without also building vector load/store (deferred, see
+    // is_vec's header): with no other way to get non-zero data into a
+    // vector register from a hand-assembled program, elementwise vv-form
+    // ops alone (0 op 0 = 0, always) can never be verified against real
+    // data. is_vmv implies is_vec; the top level treats rs1 as an
+    // ordinary scalar source (same rs1/RAT/CDB path as any ALU
+    // instruction -- no new decode field needed for it) and broadcasts
+    // its resolved value into all lanes once ready.
+    output reg is_vmv
 );
     assign rs1   = instruction[19:15];
     assign rs2   = instruction[24:20];
@@ -56,6 +84,12 @@ module decode_ooo (
     localparam OP_IMM_32 = 7'b0011011;
     localparam OP_32     = 7'b0111011;
     localparam SYSTEM    = 7'b1110011;
+    localparam OP_V      = 7'b1010111;
+
+    localparam VADD=5'd0, VSUB=5'd1, VAND=5'd2, VOR=5'd3, VXOR=5'd4, VMUL=5'd5,
+               VMIN=5'd12, VMINU=5'd13, VMAX=5'd14, VMAXU=5'd15,
+               VDIVU=5'd16, VDIV=5'd17, VREMU=5'd18, VREM=5'd19,
+               VSLL=5'd20, VSRL=5'd21, VSRA=5'd22;
 
     localparam ALU_ADD   = 4'b0010;
     localparam ALU_SUB   = 4'b1010;
@@ -92,6 +126,7 @@ module decode_ooo (
         is_load = 0; is_store = 0; is_ecall = 0;
         alu_op = ALU_ADD; word_op = 0; muldiv_op = 3'b000;
         reg_write = 0; src2_is_imm = 0; src1_is_zero = 0; src1_is_pc = 0;
+        is_vec = 0; v_op = 5'd0; is_vmv = 0;
 
         case (opcode)
             R_TYPE: begin
@@ -187,6 +222,58 @@ module decode_ooo (
                 is_alu = 1;
                 src1_is_zero = 1;
                 src2_is_imm = 1;
+            end
+
+            // Scoped RVV: .vv form only (func3=000 OPIVV, func3=010
+            // OPMVV), integer arithmetic/logic/min-max/shift/mul/div
+            // group only -- see is_vec's own port comment for everything
+            // deliberately excluded. reg_write is NOT set here (vd lives
+            // in the vector register file, not the scalar one -- the top
+            // level uses is_vec/reg_write together to route renaming and
+            // commit to the correct RAT/register file).
+            OP_V: begin
+                if (func3 == 3'b000) begin
+                    // OPIVV: integer arithmetic/logic/min-max/shift.
+                    is_vec = 1;
+                    case (instruction[31:26]) // funct6
+                        6'b000000: v_op = VADD;
+                        6'b000010: v_op = VSUB;
+                        6'b001001: v_op = VAND;
+                        6'b001010: v_op = VOR;
+                        6'b001011: v_op = VXOR;
+                        6'b000101: v_op = VMIN;
+                        6'b000100: v_op = VMINU;
+                        6'b000111: v_op = VMAX;
+                        6'b000110: v_op = VMAXU;
+                        6'b100101: v_op = VSLL;
+                        6'b101000: v_op = VSRL;
+                        6'b101001: v_op = VSRA;
+                        default: is_vec = 0; // unrecognized funct6 (e.g. compares): out of scope
+                    endcase
+                end else if (func3 == 3'b010 && instruction[31:26] >= 6'b100000) begin
+                    // OPMVV, mul/div/rem group only (funct6>=100000
+                    // excludes the disjoint low-range reduction encodings
+                    // -- see decode_control_unit.v's identical split).
+                    is_vec = 1;
+                    case (instruction[31:26])
+                        6'b100101: v_op = VMUL;
+                        6'b100000: v_op = VDIVU;
+                        6'b100001: v_op = VDIV;
+                        6'b100010: v_op = VREMU;
+                        6'b100011: v_op = VREM;
+                        default: is_vec = 0;
+                    endcase
+                end else if (func3 == 3'b100 && instruction[31:26] == 6'b010111) begin
+                    // vmv.v.x (real RVV encoding, OPIVX/VRXUNARY0) -- see
+                    // is_vmv's own port comment.
+                    is_vec = 1;
+                    is_vmv = 1;
+                end
+                // Everything else in OP_V (.vi, other OPIVX/OPMVX forms,
+                // OPMVV's reduction range, vsetvli): not decoded, is_vec
+                // stays 0 -- this instruction simply never dispatches
+                // (same safe-failure convention as an unrecognized
+                // opcode).
             end
 
             default: ; // unrecognized: no register/memory effect

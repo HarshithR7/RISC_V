@@ -12,7 +12,7 @@ RV64IMACFD+RVV feature set.
 
 ## Status
 
-**Phases 1 through 4 are all complete: 25/25 full-pipeline tests pass**,
+**Phases 1 through 7 are all complete: 32/32 full-pipeline tests pass**,
 plus 21/21 isolated ROB+RAT unit-test checks and 15/15 standalone divider
 unit tests.
 
@@ -34,6 +34,12 @@ unit tests.
   single-issue dispatch on identical RTL — see "Phase 4: benchmarking
   dispatch width, honestly" below for what it actually found (not the
   naive expectation).
+- **Phase 5**: widens the CDB and commit path to 2-wide, closing the gap
+  Phase 4 found — see "Phase 5: widening the CDB and commit path" below.
+- **Phase 6**: real, scoped RVV vector execution (data-level parallelism)
+  — see "Phase 6: data-level parallelism (vector)" below.
+- **Phase 7**: 2-thread simultaneous multithreading (SMT) — see "Phase 7:
+  simultaneous multithreading" below.
 
 Tests cover RAW/WAR/WAW hazards (including intra-group ones specific to
 2-wide dispatch), a real backward-branch loop (which, as a side effect of
@@ -543,5 +549,283 @@ CDBs and multi-port register files) — but it's worth having actually
 honestly-scoped design. Realizing genuine wall-clock ILP gains from
 2-wide dispatch on this core would require widening the CDB and commit
 path to match — a substantially larger undertaking than Phase 3's
-front-end-only widening, and a natural (if not yet started) next phase
-beyond the four originally planned.
+front-end-only widening, and a natural next phase beyond the four
+originally planned. See "Phase 5" below.
+
+## Phase 5: widening the CDB and commit path
+
+Phase 4 found that dispatch width alone doesn't help without a matching
+execute/commit path. Phase 5 closes that gap: the CDB, ROB mark ports,
+and commit are all now 2-wide, using the same two-instances-fed-
+identical-inputs trick as the register-file duplication in Phase 3
+(`register_file.v` gained a second write port, backward-compatible with
+the single-cycle RV64I core's existing single-write usage — leaving the
+new port unconnected is a safe no-op, the same extension pattern already
+used for `rob.v`'s `extra_mark` ports).
+
+- **CDB arbiter**: picks the two oldest-ready requesters per cycle via
+  two passes of the same pairwise-oldest-first reduction — pass 1 finds
+  the single oldest (structurally identical to the original 5-way
+  arbiter), pass 2 re-runs the identical reduction with pass 1's winning
+  bank masked out of contention.
+- **Every reservation-station bank** (`alu_rs`, `mul_rs`, `div_rs`, `lsq`,
+  `branch_rs`) now snoops two independent CDB buses instead of one.
+- **`rob.v`** gained a second CDB-sourced mark port and a full second
+  commit port (`head2`), retiring up to two entries per cycle. At most
+  one of the two may be a store per cycle (`data_memory.v` still has a
+  single write port) — head always has priority for that port; a second
+  same-cycle committing store simply waits one more cycle.
+- **`rat.v`** gained a second commit-clear port to match.
+
+All 25/25 pre-existing tests continued to pass, with every cycle count
+improving. Re-running the Phase 4 benchmark suite (unchanged) shows the
+qualitative fix working: dispatch width now shows a genuine, if modest,
+positive contribution (1.01x–1.10x, versus 0.90x–1.00x before). The
+magnitude is smaller than a naive "now it's 2x" expectation because
+`ENABLE_DUAL_ISSUE` only toggles dispatch width — the CDB/commit widening
+applies unconditionally to *both* configurations being compared, so even
+the "single-issue" baseline now benefits from a wider execute/commit
+path. That's the correct comparison for isolating dispatch width's own
+marginal contribution once it's no longer competing with a starved
+execute/commit path for credit.
+
+## Phase 6: data-level parallelism (vector)
+
+Adds real RVV vector execution to the out-of-order core — the DLP item
+from the original request, previously only present on the sibling
+single-cycle core. Scoped deliberately narrower than "port the whole
+RVV unit": `.vv`-form elementwise arithmetic/logic/min-max/shift/divide
+only, single-issue vector dispatch (always lane 0, like branches), no
+masking, no reductions, no `.vx`/`.vi` forms, and no vector load/store.
+
+- **Reuses `vector_alu.v` and `vector_register_file.v` unchanged** —
+  same "reuse the real execution logic" instinct as `alu_rs.v` reusing
+  `execute.v`'s scalar ALU case statements.
+- **`vec_rat.v`**: a vector RAT, structurally simpler than the scalar
+  `rat.v` (single read/write port, no intra-group forwarding needed) but
+  with the same checkpoint/restore machinery, since a vector instruction
+  dispatched during a speculative window must roll back on misprediction
+  exactly like any scalar one.
+- **`vec_rs.v`**: a vector reservation station wrapping `vector_alu.v`,
+  broadcasting on a *dedicated* `vec_mark` port on `rob.v` rather than the
+  scalar CDB — vector operands in this scope only ever come from other
+  vector instructions, so there's no cross-domain arbitration to unify.
+- **`rob.v`** gained a parallel `vec_value_arr` (VLEN-wide) alongside the
+  existing 64-bit `value_arr`, an `is_vec_dest` flag per entry, and a
+  vector commit path that shares the *same* age-ordering, squash, and
+  dual-commit machinery the scalar side already has (vector instructions
+  still get an ordinary ROB tag from the unified tag space — this is what
+  lets misprediction squash treat them exactly like any other in-flight
+  instruction, with no extra cross-domain age comparison needed).
+
+**A real gap, found immediately when writing the first test**: with only
+`.vv`-form ops in scope, and no vector load/store, there was no way to
+get non-zero data into a vector register at all (`0 op 0 = 0`, always) —
+nor any way to read a vector result back out for `check_eq` to verify.
+Fixed with two minimal, honest additions rather than silently expanding
+scope:
+- **`vmv.v.x`** (broadcast a scalar register into all vector lanes) — a
+  real RVV instruction, not a shortcut invented for this project. It's
+  the one place a vector-dest instruction reads a scalar operand; rather
+  than teaching `vec_rs.v` to snoop two unrelated CDBs for this single
+  bring-up instruction, dispatch simply stalls until the scalar source is
+  already resolved (reusing the ordinary scalar `rs1`/RAT/CDB path
+  unchanged), then feeds `vec_rs.v` an already-ready entry through its
+  ordinary add-with-zero path — no new opcode needed in `vector_alu.v` at
+  all. `asm64.py` doesn't have this mnemonic; tests emit it via `.word`
+  with a small helper built on `asm64.py`'s own `v_type()`.
+- **Vector register verification** via `tb_core_ooo.v`'s existing
+  hierarchical-reference debug convention, made permanent: an
+  unconditional `[VREGS]` dump (the same technique used for internal
+  debugging throughout every phase of this project), since there's no
+  extract/store instruction in scope to get a result into anything
+  `check_eq` could otherwise see.
+
+4/4 dedicated vector tests pass, including a dependency-chain test
+(`vadd.vv` feeding a later `vmul.vv`) that specifically exercises
+`vec_rs.v`'s own CDB snoop — an entry waiting on *another* vec_rs entry's
+not-yet-broadcast result, not just operands already resolved at dispatch.
+All 25 pre-existing tests continue to pass unmodified, since vector
+instructions are entirely orthogonal to any program that never uses the
+`OP_V` opcode.
+
+## Phase 7: simultaneous multithreading
+
+Adds 2-thread SMT — the TLP item from the original request. Originally
+asked for as "2/4 threads," settled at exactly **2 threads, built with
+the same rigor and test coverage as every earlier phase**, in exchange
+for dropping 4: a fuller writeup of that scope tradeoff (and the cache/
+MESI, redundancy items still queued behind it) belongs in project notes,
+not here, but the short version is that 4 threads' issue-priority and
+commit-arbitration surface didn't look tractable to get genuinely right
+at this project's usual depth in the same pass.
+
+- **Fully duplicated per-thread front end**: PC, 2-wide fetch, 2-wide
+  decode, `rat.v`, dual-ported `register_file.v`, `rob.v`, `branch_rs.v`
+  — each a complete, independent instance (`t0_*`/`t1_*` prefixes in
+  `riscv64_ooo_proc.v`), not a `generate` loop, matching this project's
+  existing preference for concrete, purpose-built instantiation over
+  maximally generic abstraction (see `alu_rs.v`'s own header).
+- **Shared, thread-tagged execution backend**: `alu_rs`, `mul_rs`,
+  `div_rs`, `lsq` stay single shared instances — every entry now carries
+  a 1-bit `tid` alongside its ROB tag. Issue priority moved from Phase
+  1-6's plain oldest-ROB-tag-first (no longer meaningful once there are
+  two independent ROBs' tag spaces) to **"is-own-thread-ROB-head-first,
+  else fixed lowest-index"** — a thread's own head, once ready, always
+  wins immediately, which is what actually matters for not stalling that
+  thread's commit; ties otherwise break by a fixed, bounded-starvation
+  index order, same risk profile Phase 3/4 already accepted for
+  intra-bank ties.
+- **Coarse-grained round-robin dispatch**: a single `active_thread`
+  register toggles unconditionally every cycle; one thread's full 2-wide
+  slate dispatches per cycle, never mixed-lane. This is a deliberate
+  simplicity-over-utilization tradeoff, not an oversight — a thread
+  stalled on, say, an outstanding JALR still only gets skipped on its own
+  turn rather than yielding its turn to the other thread, which would
+  claw back some throughput at the cost of a real arbiter. Almost the
+  entire Phase 3/5/6 dispatch/operand-readiness block is reused
+  *verbatim*, fed by "muxed" views of whichever thread is
+  `active_thread` this cycle (both threads' front ends are always
+  computed combinationally regardless of whose turn it is) and "demuxed"
+  back out to the correct per-thread RAT/ROB/branch\_rs write ports.
+- **CDB arbiter widened from 5-way to 6-way** (alu, thread 0's branch,
+  thread 1's branch, mul, div, lsq — `branch_rs` is two independent
+  per-thread instances now, not one shared requester) and switched from
+  the hand-unrolled pairwise-reduction age() comparison to a procedural
+  for-loop reduction using the same is-own-thread-head-first priority as
+  the RS banks, for the identical reason.
+- **Two independent per-thread squash ports** on every shared bank
+  (`squash0_*`/`squash1_*`), not one port muxed by a `tid` selector —
+  branch resolution is asynchronous to which thread is currently
+  dispatching, so both threads' outstanding branches can resolve, and
+  both mispredict, in the exact same cycle. A single muxed port could
+  only ever squash one of them that cycle, leaving the other thread's
+  wrong-path entries stale in a shared bank.
+- **Cross-thread store-commit arbitration**: `data_memory.v` still has
+  one write port. Each thread computes its own store-commit candidate
+  exactly as Phase 5 already did (untouched per-thread logic); a
+  fixed-priority arbiter (thread 0 always wins) then decides which
+  thread's store, if any, actually uses the port. If thread 1 loses and
+  its own *head* (not just head2) was the contended store, thread 1's
+  entire commit is suppressed that cycle — head2 can never retire past a
+  blocked head.
+- **Vector stays thread-0-only**, an explicit and *structurally*
+  enforced scope cut: thread 1's decode outputs are never read for
+  `is_vec` at all (hard-tied to 0 in the active-thread mux), so a vector
+  opcode in thread 1's own instruction stream simply never dispatches —
+  the same safe-failure convention this project already uses for any
+  unrecognized opcode, not a silent correctness gap.
+- **BHT stays a single shared instance** (real SMT processors commonly
+  share predictor state, and it needs no per-thread ROB-ordering
+  guarantee the way RS-bank squash does): its one update port is fed by
+  whichever thread resolves a conditional branch this cycle, thread 0
+  winning if both resolve the same cycle — a second, documented,
+  rare-but-real simplification in the same spirit as the dispatch
+  round-robin's.
+- **Cross-thread memory consistency is explicitly out of scope**:
+  `lsq.v`'s store-vs-load disambiguation only reasons about same-thread
+  entries — two threads deliberately sharing addresses is not guaranteed
+  safe, the same category of scope cut as this project having no MMU/
+  virtual memory at all.
+- **Two independent instruction memories** (`IMEM_FILE0`/`IMEM_FILE1`,
+  one per thread) so two genuinely independent programs can run
+  concurrently, with a single shared data memory (`DMEM_FILE`) — the
+  only arrangement consistent with the cross-thread-memory scope note
+  above, which presumes a shared address space.
+
+### Bugs found
+
+Phase 7 found three real bugs — all three only became *visible* once two
+threads' timing actually interleaved, though the third turned out to
+predate Phase 7 entirely.
+
+**1. Cross-thread ROB-tag collision on the shared CDB snoop path.**
+ROB tags are only unique *within* a thread — two independent ROBs both
+number their in-flight entries `0..DEPTH-1`. Every shared bank's
+"is this broadcast the operand I'm waiting on" check
+(`alu_rs.v`/`mul_rs.v`/`div_rs.v`/`lsq.v`'s CDB snoop, and the identical
+same-cycle bypass check in `riscv64_ooo_proc.v`'s own dispatch logic,
+and — once shared CDB access was accounted for — `branch_rs.v`'s
+operand snoop too, even though it isn't itself a shared bank) originally
+compared only the numeric tag, not `(tid, tag)` together. With
+`ROB_DEPTH=8`, a thread-0 entry waiting on tag 3 and an unrelated
+thread-1 producer also broadcasting tag 3 the same cycle is not a rare
+corner case — it happens routinely, and the thread-0 entry would
+silently capture the wrong thread's value as its own operand. Found via
+a hand-written regression test built specifically to trigger it
+(`t_smt_tag_collision_stress` — two threads dispatching the *same shape*
+of independent-ALU-op program in lockstep, with different immediates so
+a leaked cross-thread value produces a detectably wrong result), after
+noticing thread 0 alone produced a wrong final register value in an
+otherwise-correct short program. Fixed by adding `cdbA_tid`/`cdbB_tid`
+ports everywhere a CDB is snooped, comparing the full `(tid, tag)` pair;
+`branch_rs.v` additionally gained a compile-time `MY_TID` parameter
+(0/1, one per instantiation) since it has no per-entry `tid` storage of
+its own.
+
+**2. `commit_req2`'s downstream effects weren't actually gated on head
+also retiring — a bug present since Phase 5, only *exposed* by Phase
+7's timing.** `rob.v`'s own internal retirement logic already correctly
+requires `do_commit1` (head retiring) before it will act on
+`commit_req2` (`do_commit2 = commit_req2 && head2_ready && do_commit1`)
+— but every downstream top-level *use* of the `rob_commit_req2` wire
+(register-file write, RAT commit-clear, and, after Phase 7, store/vector
+commit) read it directly, without the same gate. `head2_ready` can
+legitimately go true — marked done via its own CDB broadcast — cycles
+before `head_ready` does; when it does, the top level was writing
+head2's value into architectural state *every such cycle*, repeatedly,
+regardless of whether head had actually retired yet. In Phase 1-6's
+single-thread testing this was silently harmless (head2's own value
+doesn't change while parked, and it does eventually retire for real once
+head catches up, so an outside observer checking final values only ever
+saw the correct end state). It stopped being harmless the instant a
+program-order-*later* instruction's premature, repeated write could
+land *before* an exact-retirement-time observation — precisely what
+`tb_core_ooo.v`'s `ecall_halt`-triggered register read is. Found by hand-
+tracing `commit_rf_write_en2`/`t0_rob_head2_tag` cycle-by-cycle against
+`ecall_halt0`'s own firing cycle in a temporary debug testbench, the same
+technique this project has used to find every non-trivial bug so far.
+Fixed once, at the source, in `commit_req2`'s own definition
+(`t0_rob_commit_req2`/`t1_rob_commit_req2` now `&&`-in `t0_rob_commit_req`/
+`t1_rob_commit_req`) rather than patching every downstream use site.
+
+**3. A genuine testbench race, not an RTL bug, in `tb_core_ooo.v`
+itself.** `ecall_halt0`/`ecall_halt1` are combinational wires derived
+from the *same clock edge's* NBA-updated ROB state. The original
+(Phase 1-6) convention evaluated `if (ecall_halt) ... #1; <read
+registers>` — settling with `#1` before reading registers, but *not*
+before evaluating the `ecall_halt` condition itself, which is exactly as
+racy for a combinational signal derived from another module's
+just-updated registers. This never manifested with a single always
+block driving everything; adding the second thread's parallel
+`ecall_halt1` check changed Icarus's scheduling enough to expose it
+(occasionally observing the wrong edge's value for `ecall_halt0`,
+displaced by one cycle from the RTL's actual retirement). Fixed by
+settling both `ecall_halt0` and `ecall_halt1` into `reg`s immediately
+after a single `#1`, *before* either condition is ever tested.
+
+### Tests
+
+3 dedicated SMT tests, plus all 29 pre-existing tests continuing to pass
+unmodified (thread 1 defaults to a trivial always-passing idle program —
+see `build_tests_ooo.py`'s `_ensure_idle_thread_mem` — so every existing
+single-thread-focused test still only needs to check thread 0's own
+result):
+
+- **`t_smt_independent_programs`**: two structurally unrelated programs
+  (a multiply, and a summing loop) running concurrently, each verified
+  against its own expected result — the basic Phase 7 claim.
+- **`t_smt_tag_collision_stress`**: the direct regression test for bug
+  #1 above — two threads dispatching the same-shaped independent-ALU-op
+  program in lockstep, with different immediates, so ROB tags collide
+  numerically many times over the run and a cross-thread leak would be
+  immediately visible in the final values.
+- **`t_smt_slow_thread_no_starvation`**: thread 0 runs a genuine
+  ~64-cycle divide (a long-outstanding, ROB-head-blocking instruction);
+  thread 1 runs a handful of independent short adds concurrently, sharing
+  the same `alu_rs`/`mul_rs`/`div_rs`/`lsq`/CDB. Both must complete
+  correctly well within a modest cycle budget — checks that
+  is-own-thread-head-first issue priority never lets one thread's
+  unrelated long-latency work starve the other's ready-and-waiting head.
+
+32/32 total.

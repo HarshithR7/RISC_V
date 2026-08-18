@@ -1,14 +1,15 @@
 `timescale 1ns / 1ps
 // Multiply reservation-station bank + the (combinational, 1-cycle)
 // multiplier itself -- same structure as alu_rs.v (lowest-free-index
-// allocation, oldest-ROB-tag-first issue -- see alu_rs.v's header for
-// why issue is age-ordered, not fixed-index), sized to 2 entries per the
-// original Phase 1 sizing plan. Handles MUL/MULH/MULHSU/MULHU
-// and MULW (the only *W multiply RISC-V defines; MULHW/MULHSUW/MULHUW
-// don't exist). Logic lifted verbatim from RV64I/src/execute.v's
-// 128-bit-multiply case statements. DIV/DIVU/REM/REMU (muldiv_op[2]==1)
-// go to div_fu/div_rs instead -- decode_ooo.v's header documents this
-// split (muldiv_op[2]==0 -> here, ==1 -> the divider).
+// allocation, is-own-thread-head-first issue -- see alu_rs.v's header
+// for the Phase 7 SMT issue-priority scheme and why it replaced plain
+// age-ordering), sized to 2 entries per the original Phase 1 sizing
+// plan. Handles MUL/MULH/MULHSU/MULHU and MULW (the only *W multiply
+// RISC-V defines; MULHW/MULHSUW/MULHUW don't exist). Logic lifted
+// verbatim from RV64I/src/execute.v's 128-bit-multiply case statements.
+// DIV/DIVU/REM/REMU (muldiv_op[2]==1) go to div_fu/div_rs instead --
+// decode_ooo.v's header documents this split (muldiv_op[2]==0 -> here,
+// ==1 -> the divider).
 module mul_rs #(
     parameter DEPTH = 2,
     parameter TAG_BITS = 3
@@ -17,6 +18,7 @@ module mul_rs #(
     input reset,
 
     input alloc_req,
+    input alloc_tid,
     input [2:0] alloc_op,        // muldiv_op: 000=MUL 001=MULH 010=MULHSU 011=MULHU
     input alloc_word_op,
     input alloc_src1_ready,
@@ -30,6 +32,7 @@ module mul_rs #(
 
     // Phase 3: lane-1 allocation port, same convention as alu_rs.v.
     input alloc2_req,
+    input alloc2_tid,
     input [2:0] alloc2_op,
     input alloc2_word_op,
     input alloc2_src1_ready,
@@ -41,19 +44,37 @@ module mul_rs #(
     input [TAG_BITS-1:0] alloc2_dest_tag,
     output has_2_free,
 
-    input cdb_valid,
-    input [TAG_BITS-1:0] cdb_tag,
-    input [63:0] cdb_value,
+    // Two independent CDB snoop buses -- see alu_rs.v's identical port,
+    // including cdbA_tid/cdbB_tid (Phase 7 fix: ROB tags are only unique
+    // per-thread, so snoop matching must compare the full (tid,tag) pair,
+    // not the tag alone).
+    input cdbA_valid,
+    input cdbA_tid,
+    input [TAG_BITS-1:0] cdbA_tag,
+    input [63:0] cdbA_value,
+    input cdbB_valid,
+    input cdbB_tid,
+    input [TAG_BITS-1:0] cdbB_tag,
+    input [63:0] cdbB_value,
 
     output req_valid,
+    output req_tid,
     output [TAG_BITS-1:0] req_tag,
     output [63:0] req_value,
     input req_grant,
 
-    // Phase 2 misprediction squash -- same convention as alu_rs.v.
-    input [TAG_BITS-1:0] rob_head_tag,
-    input squash_valid,
-    input [TAG_BITS-1:0] squash_tag
+    // Phase 7: one head tag per thread -- see alu_rs.v's header.
+    input [TAG_BITS-1:0] rob_head_tag0,
+    input [TAG_BITS-1:0] rob_head_tag1,
+
+    // Phase 2 misprediction squash, now two independent per-thread ports
+    // (Phase 7) -- see alu_rs.v's identical port and header comment for
+    // why a single muxed port can't handle both threads mispredicting in
+    // the same cycle.
+    input squash0_valid,
+    input [TAG_BITS-1:0] squash0_tag,
+    input squash1_valid,
+    input [TAG_BITS-1:0] squash1_tag
 );
     localparam MUL    = 3'b000;
     localparam MULH   = 3'b001;
@@ -61,6 +82,7 @@ module mul_rs #(
     localparam MULHU  = 3'b011;
 
     reg busy       [0:DEPTH-1];
+    reg tid_arr    [0:DEPTH-1];
     reg [2:0] op    [0:DEPTH-1];
     reg word_op_arr[0:DEPTH-1];
     reg s1_ready   [0:DEPTH-1];
@@ -108,21 +130,31 @@ module mul_rs #(
     wire do_alloc1 = alloc_req  && have_free;
     wire do_alloc2 = alloc2_req && have_free2;
 
-    // ---- Issue: oldest ready busy entry (age-ordered, see header) ----
+    // ---- Issue: is-own-thread-head-first, else fixed lowest-index
+    // (Phase 7 -- see alu_rs.v's header) ----
+    function entry_is_head;
+        input t;
+        input [TAG_BITS-1:0] tg;
+        begin
+            entry_is_head = t ? (tg == rob_head_tag1) : (tg == rob_head_tag0);
+        end
+    endfunction
+
     integer ri;
     reg have_ready;
     reg [31:0] ready_idx;
-    reg [TAG_BITS-1:0] ready_best_age;
+    reg ready_is_head;
     always @(*) begin
         have_ready = 1'b0;
         ready_idx = 0;
-        ready_best_age = 0;
+        ready_is_head = 1'b0;
         for (ri = 0; ri < DEPTH; ri = ri + 1)
-            if (busy[ri] && s1_ready[ri] && s2_ready[ri] &&
-                (!have_ready || age(dest_tag[ri]) < ready_best_age)) begin
-                have_ready = 1'b1;
-                ready_idx = ri;
-                ready_best_age = age(dest_tag[ri]);
+            if (busy[ri] && s1_ready[ri] && s2_ready[ri]) begin
+                if (!have_ready || (entry_is_head(tid_arr[ri], dest_tag[ri]) && !ready_is_head)) begin
+                    have_ready = 1'b1;
+                    ready_idx = ri;
+                    ready_is_head = entry_is_head(tid_arr[ri], dest_tag[ri]);
+                end
             end
     end
 
@@ -155,36 +187,37 @@ module mul_rs #(
     end
 
     assign req_valid = have_ready;
+    assign req_tid   = tid_arr[ready_idx];
     assign req_tag   = dest_tag[ready_idx];
     assign req_value = word_op_arr[ready_idx] ? mul_word_result_ext : mul_full_result;
-
-    function [TAG_BITS-1:0] age;
-        input [TAG_BITS-1:0] t;
-        begin
-            age = t - rob_head_tag;
-        end
-    endfunction
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             for (fi = 0; fi < DEPTH; fi = fi + 1)
                 busy[fi] <= 1'b0;
         end else begin
-            if (cdb_valid) begin
+            if (cdbA_valid || cdbB_valid) begin
                 for (fi = 0; fi < DEPTH; fi = fi + 1) begin
-                    if (busy[fi] && !s1_ready[fi] && s1_tag[fi] == cdb_tag) begin
+                    if (busy[fi] && !s1_ready[fi] && cdbA_valid && tid_arr[fi] == cdbA_tid && s1_tag[fi] == cdbA_tag) begin
                         s1_ready[fi] <= 1'b1;
-                        s1_val[fi]   <= cdb_value;
+                        s1_val[fi]   <= cdbA_value;
+                    end else if (busy[fi] && !s1_ready[fi] && cdbB_valid && tid_arr[fi] == cdbB_tid && s1_tag[fi] == cdbB_tag) begin
+                        s1_ready[fi] <= 1'b1;
+                        s1_val[fi]   <= cdbB_value;
                     end
-                    if (busy[fi] && !s2_ready[fi] && s2_tag[fi] == cdb_tag) begin
+                    if (busy[fi] && !s2_ready[fi] && cdbA_valid && tid_arr[fi] == cdbA_tid && s2_tag[fi] == cdbA_tag) begin
                         s2_ready[fi] <= 1'b1;
-                        s2_val[fi]   <= cdb_value;
+                        s2_val[fi]   <= cdbA_value;
+                    end else if (busy[fi] && !s2_ready[fi] && cdbB_valid && tid_arr[fi] == cdbB_tid && s2_tag[fi] == cdbB_tag) begin
+                        s2_ready[fi] <= 1'b1;
+                        s2_val[fi]   <= cdbB_value;
                     end
                 end
             end
 
             if (do_alloc1) begin
                 busy[free_idx]     <= 1'b1;
+                tid_arr[free_idx]  <= alloc_tid;
                 op[free_idx]       <= alloc_op;
                 word_op_arr[free_idx] <= alloc_word_op;
                 s1_ready[free_idx] <= alloc_src1_ready;
@@ -197,6 +230,7 @@ module mul_rs #(
             end
             if (do_alloc2) begin
                 busy[free_idx2]     <= 1'b1;
+                tid_arr[free_idx2]  <= alloc2_tid;
                 op[free_idx2]       <= alloc2_op;
                 word_op_arr[free_idx2] <= alloc2_word_op;
                 s1_ready[free_idx2] <= alloc2_src1_ready;
@@ -212,9 +246,16 @@ module mul_rs #(
                 busy[ready_idx] <= 1'b0;
             end
 
-            if (squash_valid) begin
+            if (squash0_valid) begin
                 for (fi = 0; fi < DEPTH; fi = fi + 1)
-                    if (busy[fi] && age(dest_tag[fi]) > age(squash_tag))
+                    if (busy[fi] && !tid_arr[fi] &&
+                        (dest_tag[fi] - rob_head_tag0) > (squash0_tag - rob_head_tag0))
+                        busy[fi] <= 1'b0;
+            end
+            if (squash1_valid) begin
+                for (fi = 0; fi < DEPTH; fi = fi + 1)
+                    if (busy[fi] && tid_arr[fi] &&
+                        (dest_tag[fi] - rob_head_tag1) > (squash1_tag - rob_head_tag1))
                         busy[fi] <= 1'b0;
             end
         end

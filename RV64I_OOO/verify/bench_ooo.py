@@ -25,9 +25,10 @@ os.makedirs(GEN, exist_ok=True)
 sys.path.insert(0, RV64I_VERIFY)
 import asm64 as asm  # noqa: E402
 
-REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "data_memory.v"]
-OOO_RTL = ["decode_ooo.v", "rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v", "div_fu.v",
-           "lsq.v", "bht.v", "riscv64_ooo_proc.v"]
+REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "data_memory.v",
+              "vector_register_file.v", "vector_alu.v"]
+OOO_RTL = ["decode_ooo.v", "rat.v", "vec_rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v",
+           "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "riscv64_ooo_proc.v"]
 
 
 class Bench:
@@ -50,7 +51,20 @@ class Bench:
         return "\n".join(lines)
 
 
+IDLE_THREAD_MEM = os.path.join(GEN, "idle_thread.mem")
+
+
+def _ensure_idle_thread_mem():
+    """Phase 7 (SMT): the core always runs two threads -- see
+    build_tests_ooo.py's identical helper for why thread 1 needs a real,
+    always-passing idle program by default."""
+    if not os.path.exists(IDLE_THREAD_MEM):
+        items = asm.assemble_to_mem("li x31, 0xFFFF0000\necall")
+        asm.write_imem_halfwords(IDLE_THREAD_MEM, items)
+
+
 def run_once(bench, enable_dual_issue, max_cycles=50000):
+    _ensure_idle_thread_mem()
     name = f"{bench.name}_d{enable_dual_issue}"
     src = bench.source()
     items = asm.assemble_to_mem(src)
@@ -64,7 +78,8 @@ def run_once(bench, enable_dual_issue, max_cycles=50000):
         f.write(f"""`timescale 1ns/1ps
 module tb_{name};
     tb_bench_ooo #(
-        .IMEM_FILE("{name}.mem"),
+        .IMEM_FILE0("{name}.mem"),
+        .IMEM_FILE1("idle_thread.mem"),
         .DMEM_FILE("{name}_data.mem"),
         .TEST_NAME("{name}"),
         .ENABLE_DUAL_ISSUE({enable_dual_issue}),

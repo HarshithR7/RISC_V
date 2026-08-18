@@ -1,14 +1,25 @@
 `timescale 1ns / 1ps
 // Generic self-checking testbench for the out-of-order core. Same
-// convention as the single-cycle RV64I suite's tb_core64.v: program ends
-// with `li x31, 0xFFFF0000 ; ecall` on success. ecall_halt fires when
-// ECALL retires at the ROB head (see riscv64_ooo_proc.v), i.e. only once
-// every older in-flight instruction -- including a still-executing
-// multi-cycle multiply or divide -- has actually committed, so the
-// x31 check below is guaranteed to observe final, precise architectural
-// state, not a snapshot mid-flight.
+// convention as the single-cycle RV64I suite's tb_core64.v: a program ends
+// with `li x31, 0xFFFF0000 ; ecall` on success. ecall_halt0/ecall_halt1
+// fire when ECALL retires at each thread's own ROB head (see
+// riscv64_ooo_proc.v), i.e. only once every older in-flight instruction on
+// that thread -- including a still-executing multi-cycle multiply or
+// divide -- has actually committed, so the x31 checks below are guaranteed
+// to observe final, precise per-thread architectural state, not a
+// snapshot mid-flight.
+//
+// Phase 7 (SMT): the core now always runs two threads. Most existing
+// tests only care about thread 0's result; thread 1 defaults to a trivial
+// "li x31, 0xFFFF0000; ecall" idle program (IMEM_FILE1's default) so it
+// halts almost immediately and reports its own [PASS-T1] without any
+// special-casing needed here -- genuine SMT tests instead give both
+// IMEM_FILE0 and IMEM_FILE1 real, independent programs and check both
+// [PASS-T0]/[PASS-T1] lines. Simulation ends once BOTH threads have
+// halted (or the shared MAX_CYCLES timeout elapses).
 module tb_core_ooo #(
-    parameter IMEM_FILE = "test.mem",
+    parameter IMEM_FILE0 = "test.mem",
+    parameter IMEM_FILE1 = "idle_thread.mem",
     parameter DMEM_FILE = "test_data.mem",
     parameter TEST_NAME = "test",
     parameter integer MAX_CYCLES = 20000
@@ -16,44 +27,78 @@ module tb_core_ooo #(
     localparam [63:0] PASS_CODE = 64'hFFFF0000;
 
     reg clk, reset;
-    wire [63:0] pc_out;
-    wire ecall_halt;
+    wire [63:0] pc_out0, pc_out1;
+    wire ecall_halt0, ecall_halt1;
     integer cycles;
+    reg done0, done1;
 
-    riscv64_ooo_proc #(.IMEM_FILE(IMEM_FILE), .DMEM_FILE(DMEM_FILE)) uut (
+    riscv64_ooo_proc #(.IMEM_FILE0(IMEM_FILE0), .IMEM_FILE1(IMEM_FILE1), .DMEM_FILE(DMEM_FILE)) uut (
         .clk(clk), .reset(reset),
-        .pc_out(pc_out), .ecall_halt(ecall_halt)
+        .pc_out0(pc_out0), .pc_out1(pc_out1),
+        .ecall_halt0(ecall_halt0), .ecall_halt1(ecall_halt1)
     );
 
     initial begin clk = 0; forever #50 clk = ~clk; end
-    initial begin reset = 1; cycles = 0; #100; reset = 0; end
+    initial begin reset = 1; cycles = 0; done0 = 0; done1 = 0; #100; reset = 0; end
 
+    // ecall_halt0/ecall_halt1 are combinational wires derived from this
+    // same edge's NBA-updated ROB state (head_ptr/valid_arr/done_arr
+    // inside rob.v) -- evaluating them directly in this block's `if`
+    // condition, with no settling delay, races that NBA update: whether
+    // this read observes the pre- or post-edge value is scheduler-
+    // dependent, not guaranteed. Settling with `#1` *before* forming the
+    // conditions (not only before the later register reads, which was
+    // this testbench's original -- and, it turns out, still racy --
+    // convention) makes every read in this block observe a single,
+    // consistent, fully-settled post-edge snapshot.
+    reg halt0_seen, halt1_seen;
     always @(posedge clk) begin
         if (!reset) begin
             cycles = cycles + 1;
-            if (ecall_halt) begin
-                #1;
-                // Unconditional register dump (x5-x10), independent of
-                // the x31/PASS_CODE convention below: step 3's earliest
-                // tests (before branch support exists in step 4) can't
-                // use the usual bne-based check_eq self-check, since that
-                // needs a branch instruction this core doesn't dispatch
-                // yet -- those tests instead write their result into a
-                // known register and end with an unconditional `ecall`,
-                // and the Python driver greps this line for the expected
-                // value instead of relying on in-program branching.
+            #1;
+            halt0_seen = ecall_halt0;
+            halt1_seen = ecall_halt1;
+
+            if (!done0 && halt0_seen) begin
+                done0 = 1;
+                // Unconditional register dump (x5-x10) for thread 0, same
+                // convention as Phase 1-6's single-thread [REGS] line --
+                // see run_branch_free's header in build_tests_ooo.py.
                 $display("[REGS] x5=%h x6=%h x7=%h x8=%h x9=%h x10=%h",
-                          uut.regfile0.registers[5], uut.regfile0.registers[6],
-                          uut.regfile0.registers[7], uut.regfile0.registers[8],
-                          uut.regfile0.registers[9], uut.regfile0.registers[10]);
-                if (uut.regfile0.registers[31] === PASS_CODE)
-                    $display("[PASS] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out);
+                          uut.t0_regfile0.registers[5], uut.t0_regfile0.registers[6],
+                          uut.t0_regfile0.registers[7], uut.t0_regfile0.registers[8],
+                          uut.t0_regfile0.registers[9], uut.t0_regfile0.registers[10]);
+                // Vector register dump (v1-v4): thread-0-only (Phase 6/7
+                // scope), same permanent verification-hook convention as
+                // before (no vector store/extract instruction in scope).
+                $display("[VREGS] v1=%h v2=%h v3=%h v4=%h",
+                          uut.vregfile_i.registers[1], uut.vregfile_i.registers[2],
+                          uut.vregfile_i.registers[3], uut.vregfile_i.registers[4]);
+                if (uut.t0_regfile0.registers[31] === PASS_CODE)
+                    $display("[PASS-T0] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out0);
                 else
-                    $display("[FAIL] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.regfile0.registers[31], cycles, pc_out);
+                    $display("[FAIL-T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.t0_regfile0.registers[31], cycles, pc_out0);
+            end
+
+            if (!done1 && halt1_seen) begin
+                done1 = 1;
+                $display("[REGS1] x5=%h x6=%h x7=%h x8=%h x9=%h x10=%h",
+                          uut.t1_regfile0.registers[5], uut.t1_regfile0.registers[6],
+                          uut.t1_regfile0.registers[7], uut.t1_regfile0.registers[8],
+                          uut.t1_regfile0.registers[9], uut.t1_regfile0.registers[10]);
+                if (uut.t1_regfile0.registers[31] === PASS_CODE)
+                    $display("[PASS-T1] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out1);
+                else
+                    $display("[FAIL-T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.t1_regfile0.registers[31], cycles, pc_out1);
+            end
+
+            if (done0 && done1) begin
                 $finish;
             end
+
             if (cycles >= MAX_CYCLES) begin
-                $display("[TIMEOUT] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out);
+                if (!done0) $display("[TIMEOUT-T0] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out0);
+                if (!done1) $display("[TIMEOUT-T1] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out1);
                 $finish;
             end
         end

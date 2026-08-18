@@ -6,6 +6,7 @@ the same TestBuilder/check_eq/x31=PASS convention as
 RV64I/verify/build_tests64.py.
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -19,11 +20,21 @@ os.makedirs(GEN, exist_ok=True)
 sys.path.insert(0, RV64I_VERIFY)
 import asm64 as asm  # noqa: E402
 
+
+def vmv_v_x(vd, rs1):
+    """vmv.v.x vd, rs1 -- real RVV encoding (OPIVX/VRXUNARY0, funct6=0b010111),
+    not in asm64.py's mnemonic table (added to decode_ooo.v specifically to
+    make the vector pipeline testable -- see its is_vmv header). Built with
+    asm64's own v_type() helper and emitted as a raw .word line."""
+    word = asm.v_type(0b010111, 1, 0, rs1, 0b100, vd)
+    return f".word 0x{word:08x}"
+
 # Reused unchanged from the single-cycle core.
-REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "data_memory.v"]
+REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "data_memory.v",
+              "vector_register_file.v", "vector_alu.v"]
 # New for the out-of-order core.
-OOO_RTL = ["decode_ooo.v", "rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v", "div_fu.v",
-           "lsq.v", "bht.v", "riscv64_ooo_proc.v"]
+OOO_RTL = ["decode_ooo.v", "rat.v", "vec_rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v",
+           "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "riscv64_ooo_proc.v"]
 
 
 class TestBuilder:
@@ -56,12 +67,48 @@ class TestBuilder:
         return "\n".join(lines)
 
 
-def build_and_run(tb, dmem_words=None, max_cycles=20000):
+IDLE_THREAD_MEM = os.path.join(GEN, "idle_thread.mem")
+
+
+def _ensure_idle_thread_mem():
+    """Phase 7 (SMT): the core always runs two threads. Tests that only
+    care about thread 0 (the overwhelming majority -- everything built
+    before Phase 7) still need a real, valid program on thread 1, or its
+    front end would just fetch whatever garbage/zero words happen to sit
+    in an uninitialized instruction memory. A trivial always-passing
+    `li x31, 0xFFFF0000; ecall` -- the same convention every other test's
+    success path already uses -- means thread 1 halts almost immediately
+    and reports its own clean [PASS-T1], with zero special-casing needed
+    in tb_core_ooo.v itself. Generated once and reused by every
+    single-thread-focused test.
+    """
+    if not os.path.exists(IDLE_THREAD_MEM):
+        items = asm.assemble_to_mem("li x31, 0xFFFF0000\necall")
+        asm.write_imem_halfwords(IDLE_THREAD_MEM, items)
+
+
+def build_and_run(tb, dmem_words=None, max_cycles=20000, tb1=None):
+    """Compiles and runs one test. By default thread 1 gets the trivial
+    idle/pass program (see _ensure_idle_thread_mem) and only thread 0's
+    [PASS-T0]/[FAIL-T0] line is returned as `result_line`, matching every
+    pre-Phase-7 test's expectations. Pass `tb1` (a second TestBuilder) for
+    a genuine SMT test -- both programs run concurrently and
+    `result_line` becomes thread 0's line; use `line1_of(log)` (below) to
+    pull thread 1's line out of the same log.
+    """
+    _ensure_idle_thread_mem()
     name = tb.name
     src = tb.source()
     items = asm.assemble_to_mem(src)
     imem_path = os.path.join(GEN, f"{name}.mem")
     asm.write_imem_halfwords(imem_path, items)
+
+    if tb1 is not None:
+        imem1_name = f"{tb1.name}.mem"
+        imem1_path = os.path.join(GEN, imem1_name)
+        asm.write_imem_halfwords(imem1_path, asm.assemble_to_mem(tb1.source()))
+    else:
+        imem1_name = "idle_thread.mem"
 
     dmem_path = os.path.join(GEN, f"{name}_data.mem")
     if dmem_words is None:
@@ -73,7 +120,8 @@ def build_and_run(tb, dmem_words=None, max_cycles=20000):
         f.write(f"""`timescale 1ns/1ps
 module tb_{name};
     tb_core_ooo #(
-        .IMEM_FILE("{name}.mem"),
+        .IMEM_FILE0("{name}.mem"),
+        .IMEM_FILE1("{imem1_name}"),
         .DMEM_FILE("{name}_data.mem"),
         .TEST_NAME("{name}"),
         .MAX_CYCLES({max_cycles})
@@ -96,9 +144,18 @@ endmodule
     out = r2.stdout + r2.stderr
     result_line = ""
     for line in out.splitlines():
-        if line.startswith("[PASS]") or line.startswith("[FAIL]") or line.startswith("[TIMEOUT]"):
+        if line.startswith("[PASS-T0]") or line.startswith("[FAIL-T0]") or line.startswith("[TIMEOUT-T0]"):
             result_line = line
     return result_line, out
+
+
+def line1_of(log):
+    """Pulls thread 1's PASS/FAIL/TIMEOUT line out of an SMT test's log
+    (see build_and_run's tb1 parameter)."""
+    for line in log.splitlines():
+        if line.startswith("[PASS-T1]") or line.startswith("[FAIL-T1]") or line.startswith("[TIMEOUT-T1]"):
+            return line
+    return ""
 
 
 import re  # noqa: E402
@@ -127,7 +184,7 @@ def run_branch_free(name, asm_body, expected):
     t.asm(asm_body)
     t.asm("li x31, 0xFFFF0000\necall")
     line, log = build_and_run(t)
-    if not line.startswith("[PASS]"):
+    if not line.startswith("[PASS-T0]"):
         return f"[FAIL] {name}: core didn't reach ecall cleanly\n{log[-2000:]}"
     regs = parse_regs(log)
     if regs is None:
@@ -138,6 +195,46 @@ def run_branch_free(name, asm_body, expected):
         if regs[reg] != exp_val:
             return f"[FAIL] {name}: {reg}=0x{regs[reg]:016x} expected 0x{exp_val:016x}"
     return f"[PASS] {name}: {regs}"
+
+
+def parse_vregs(log):
+    m = re.search(r"\[VREGS\] v1=([0-9a-f]+) v2=([0-9a-f]+) v3=([0-9a-f]+) v4=([0-9a-f]+)", log)
+    if not m:
+        return None
+    return {f"v{i}": int(m.group(idx), 16) for idx, i in enumerate([1, 2, 3, 4], start=1)}
+
+
+def lanes_val(lanes, value32):
+    """Broadcasts a 32-bit value across `lanes` 32-bit lanes -- the expected
+    shape of a vmv.v.x result, and of any elementwise op fed by two such
+    broadcasts (every lane computes the identical result)."""
+    v = 0
+    for _ in range(lanes):
+        v = (v << 32) | (value32 & 0xFFFFFFFF)
+    return v
+
+
+def run_vec_test(name, asm_body, expected_vregs, lanes=4):
+    """Phase 6 (DLP) vector tests: no vector store or extract instruction
+    in scope (see decode_ooo.v's is_vec header), so results are read back
+    via tb_core_ooo.v's unconditional [VREGS] hierarchical dump instead of
+    the normal check_eq/bne convention -- same reasoning as
+    run_branch_free's [REGS] dump, just for vector registers.
+    """
+    t = TestBuilder(name)
+    t.asm(asm_body)
+    t.asm("li x31, 0xFFFF0000\necall")
+    line, log = build_and_run(t)
+    if not line.startswith("[PASS-T0]"):
+        return f"[FAIL] {name}: core didn't reach ecall cleanly\n{log[-2000:]}"
+    vregs = parse_vregs(log)
+    if vregs is None:
+        return f"[FAIL] {name}: no [VREGS] line found\n{log[-2000:]}"
+    for vreg, exp32 in expected_vregs.items():
+        exp_val = lanes_val(lanes, exp32) & ((1 << (32 * lanes)) - 1)
+        if vregs[vreg] != exp_val:
+            return f"[FAIL] {name}: {vreg}=0x{vregs[vreg]:0{lanes*8}x} expected 0x{exp_val:0{lanes*8}x}"
+    return f"[PASS] {name}: {vregs}"
 
 
 def t_single_alu():
@@ -620,9 +717,190 @@ add x17, x1, x2
     return t
 
 
+def t_vec_add():
+    body = f"""
+li x5, 10
+li x6, 20
+{vmv_v_x(1, 5)}
+{vmv_v_x(2, 6)}
+vadd.vv v3, v1, v2
+"""
+    return run_vec_test("ooo_vec_add", body, {"v1": 10, "v2": 20, "v3": 30})
+
+
+def t_vec_sub_mul():
+    # vsub.vv vd,vs2,vs1 computes vs2-vs1 (a=vs2,b=vs1 in vector_alu.v's
+    # own operand convention -- see riscv64_ooo_proc.v's vec_rs.v wiring
+    # comment). v1=20, v2=6: v3=v1-v2=14, v4=v1*v2=120.
+    body = f"""
+li x5, 20
+li x6, 6
+{vmv_v_x(1, 5)}
+{vmv_v_x(2, 6)}
+vsub.vv v3, v1, v2
+vmul.vv v4, v1, v2
+"""
+    return run_vec_test("ooo_vec_sub_mul", body, {"v3": 14, "v4": 120})
+
+
+def t_vec_dependency_chain():
+    # v3 depends on v1/v2 (both vmv.v.x broadcasts); v4 depends on v3 and
+    # v1 -- exercises vec_rs's own CDB snoop (an entry waiting on another
+    # vec_rs entry's not-yet-broadcast result), not just operands that are
+    # already resolved at dispatch time the way t_vec_add's are.
+    body = f"""
+li x5, 3
+li x6, 4
+{vmv_v_x(1, 5)}
+{vmv_v_x(2, 6)}
+vadd.vv v3, v1, v2
+vmul.vv v4, v3, v1
+"""
+    return run_vec_test("ooo_vec_dependency_chain", body, {"v3": 7, "v4": 21})
+
+
+def t_vec_divide():
+    body = f"""
+li x5, 100
+li x6, 7
+{vmv_v_x(1, 5)}
+{vmv_v_x(2, 6)}
+vdivu.vv v3, v1, v2
+vremu.vv v4, v1, v2
+"""
+    return run_vec_test("ooo_vec_divide", body, {"v3": 14, "v4": 2})
+
+
+def run_smt_test(tb0, tb1, max_cycles=20000):
+    """Runs two genuinely independent programs concurrently, one per
+    thread, and requires BOTH to reach their own ecall cleanly with the
+    correct result -- see build_and_run's tb1 parameter. Returns a single
+    combined [PASS]/[FAIL] line (this suite's normal reporting
+    convention), not the raw per-thread lines."""
+    line0, log = build_and_run(tb0, tb1=tb1, max_cycles=max_cycles)
+    line1 = line1_of(log)
+    ok0 = line0.startswith("[PASS-T0]")
+    ok1 = line1.startswith("[PASS-T1]")
+    if ok0 and ok1:
+        return f"[PASS] smt/{tb0.name}+{tb1.name}: t0 ok, t1 ok"
+    return (f"[FAIL] smt/{tb0.name}+{tb1.name}: t0={line0 or '(no line)'} t1={line1 or '(no line)'}\n"
+            f"{log[-3000:]}")
+
+
+def t_smt_independent_programs():
+    # Two structurally unrelated programs, running concurrently, each
+    # checked against its own expected result -- the basic Phase 7 claim:
+    # per-thread front end/RAT/ROB/branch_rs, shared thread-tagged
+    # execution backend, and the round-robin dispatcher together produce
+    # two genuinely independent, simultaneously-correct programs, not just
+    # one that happens to work while the other is idle (see
+    # t_smt_tag_collision_stress below for the harder version of this
+    # claim).
+    t0 = TestBuilder("smt_t0_mul")
+    t0.asm("""
+li x5, 6
+li x6, 7
+mul x7, x5, x6
+""")
+    t0.check_eq("x7", 42)
+
+    t1 = TestBuilder("smt_t1_loop")
+    t1.asm("""
+li x5, 0
+li x6, 1
+loop:
+add x5, x5, x6
+addi x6, x6, 1
+li x7, 4
+bne x6, x7, loop
+""")
+    t1.check_eq("x5", 6)  # 1+2+3
+
+    return run_smt_test(t0, t1)
+
+
+def t_smt_tag_collision_stress():
+    # The direct regression test for the cross-thread ROB-tag-collision
+    # bug this phase's development actually found (see alu_rs.v's/
+    # mul_rs.v's/div_rs.v's/lsq.v's/branch_rs.v's cdbA_tid/cdbB_tid ports
+    # and riscv64_ooo_proc.v's cdbA_hits_active/cdbB_hits_active): two
+    # threads dispatching the *same shape* of independent-ALU-op program
+    # in lockstep will, with ROB_DEPTH=8, very quickly and repeatedly
+    # allocate numerically identical tags in each other's independent ROBs
+    # -- exactly the condition a tag-only (not (tid,tag)) CDB snoop
+    # compare would confuse. The two threads use *different* immediates,
+    # so a leaked cross-thread value produces a detectably wrong result
+    # rather than silently matching by coincidence.
+    t0 = TestBuilder("smt_t0_collide")
+    t0.asm("""
+li x1, 10
+li x2, 20
+add x10, x1, x2
+add x11, x1, x2
+add x12, x1, x2
+add x13, x1, x2
+add x14, x1, x2
+add x15, x1, x2
+add x16, x1, x2
+add x17, x1, x2
+""")
+    t0.check_eq("x17", 30)
+
+    t1 = TestBuilder("smt_t1_collide")
+    t1.asm("""
+li x1, 100
+li x2, 200
+add x10, x1, x2
+add x11, x1, x2
+add x12, x1, x2
+add x13, x1, x2
+add x14, x1, x2
+add x15, x1, x2
+add x16, x1, x2
+add x17, x1, x2
+""")
+    t1.check_eq("x17", 300)
+
+    return run_smt_test(t0, t1)
+
+
+def t_smt_slow_thread_no_starvation():
+    # Thread 0 does a real ~64-cycle divide (a genuinely slow, ROB-head-
+    # blocking instruction); thread 1 does a handful of independent short
+    # adds that would complete almost immediately in isolation. Both
+    # threads share alu_rs/mul_rs/div_rs/lsq and the CDB, arbitrated by
+    # "is-own-thread-head-first" (see alu_rs.v's header) rather than a
+    # global age order that no longer means anything across two
+    # independent ROBs. This checks that thread 1's own head, once ready,
+    # is never starved by thread 0's unrelated, still-outstanding divide
+    # -- both threads must complete correctly well within a modest cycle
+    # budget, not just eventually/at the MAX_CYCLES timeout.
+    t0 = TestBuilder("smt_t0_divide")
+    t0.asm("""
+li x20, 100
+li x21, 7
+div x5, x20, x21
+""")
+    t0.check_eq("x5", 14)
+
+    t1 = TestBuilder("smt_t1_fast")
+    t1.asm("""
+li x1, 1
+li x2, 2
+add x10, x1, x2
+add x11, x1, x2
+add x12, x1, x2
+add x13, x1, x2
+""")
+    t1.check_eq("x13", 3)
+
+    return run_smt_test(t0, t1, max_cycles=500)
+
+
 def main():
     results = []
-    for fn in [t_single_alu, t_raw_chain, t_word_ops]:
+    for fn in [t_single_alu, t_raw_chain, t_word_ops,
+               t_vec_add, t_vec_sub_mul, t_vec_dependency_chain, t_vec_divide]:
         line = fn()
         print(line)
         results.append(line)
@@ -636,7 +914,7 @@ def main():
         t = fn()
         line, log = build_and_run(t)
         print(line)
-        if not line.startswith("[PASS]"):
+        if not line.startswith("[PASS-T0]"):
             print(log[-3000:])
         results.append(line)
 
@@ -647,7 +925,7 @@ def main():
     t = t_div_long_latency_overlap()
     line, log = build_and_run(t)
     print(line)
-    if not line.startswith("[PASS]"):
+    if not line.startswith("[PASS-T0]"):
         print(log[-3000:])
     else:
         m = re.search(r"(\d+) cycles", line)
@@ -665,7 +943,20 @@ def main():
             print(line)
     results.append(line)
 
-    passed = sum(1 for r in results if r.startswith("[PASS]"))
+    # Phase 7 (SMT): dedicated 2-thread tests -- two concurrently-running,
+    # independently-correct programs, a direct regression test for the
+    # cross-thread ROB-tag-collision bug this phase's development found,
+    # and a starvation check.
+    for fn in [t_smt_independent_programs, t_smt_tag_collision_stress, t_smt_slow_thread_no_starvation]:
+        line = fn()
+        print(line)
+        results.append(line)
+
+    # run_branch_free/run_vec_test report via their own "[PASS] name: ..."
+    # convention (built from build_and_run's [PASS-T0] line internally, see
+    # their headers); the second/third batches use build_and_run's
+    # [PASS-T0] line directly. Both count as passing here.
+    passed = sum(1 for r in results if r.startswith("[PASS-T0]") or r.startswith("[PASS]"))
     print(f"\n{passed}/{len(results)} passed")
 
 

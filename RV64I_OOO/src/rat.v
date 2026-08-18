@@ -82,6 +82,20 @@ module rat #(
     input [4:0] commit_rd,
     input [TAG_BITS-1:0] commit_tag,
 
+    // Widened-commit support: a second, independent commit-clear for the
+    // ROB's head+1 entry (see rob.v's dual-commit header). Same
+    // conditional-clear semantics as commit_clear_en -- only fires if the
+    // RAT's *current* tag for that register still matches commit_tag2.
+    // No special ordering is needed relative to commit_clear_en even
+    // though both can fire the same cycle: head and head+1 always carry
+    // *different* ROB tags, so at most one of the two conditional clears
+    // can ever actually match a given register's current tag -- there's
+    // no real WAW race to resolve here, unlike write_en-vs-write2_en's
+    // genuine same-cycle-rename race below.
+    input commit_clear_en2,
+    input [4:0] commit_rd2,
+    input [TAG_BITS-1:0] commit_tag2,
+
     // Phase 2 speculation support: a single checkpoint (matching
     // branch_rs's own single-outstanding-branch scoping -- see
     // riscv64_ooo_proc.v's header). checkpoint_save snapshots live
@@ -126,11 +140,14 @@ module rat #(
                 busy_cp[i] <= 1'b0;
             end
         end else begin
-            // Mirror this cycle's commit-clear into the shadow first (see
-            // header -- always safe, whether or not a checkpoint is
+            // Mirror this cycle's commit-clear(s) into the shadow first
+            // (see header -- always safe, whether or not a checkpoint is
             // currently "active"; harmless no-op otherwise).
             if (commit_clear_en && commit_rd != 5'd0 && tag_cp[commit_rd] == commit_tag) begin
                 busy_cp[commit_rd] <= 1'b0;
+            end
+            if (commit_clear_en2 && commit_rd2 != 5'd0 && tag_cp[commit_rd2] == commit_tag2) begin
+                busy_cp[commit_rd2] <= 1'b0;
             end
 
             // Order matters -- see module header. Conditional clear
@@ -139,6 +156,9 @@ module rat #(
             // rename wins if both target the same register.
             if (commit_clear_en && commit_rd != 5'd0 && tag[commit_rd] == commit_tag) begin
                 busy[commit_rd] <= 1'b0;
+            end
+            if (commit_clear_en2 && commit_rd2 != 5'd0 && tag[commit_rd2] == commit_tag2) begin
+                busy[commit_rd2] <= 1'b0;
             end
             if (write_en && rd != 5'd0) begin
                 busy[rd] <= 1'b1;

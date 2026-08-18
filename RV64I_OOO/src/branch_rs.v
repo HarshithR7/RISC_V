@@ -23,7 +23,20 @@
 // address broadcast can never be silently lost by a new branch reusing
 // this single slot before the old one's value has actually gone out.
 module branch_rs #(
-    parameter TAG_BITS = 3
+    parameter TAG_BITS = 3,
+    // Phase 7 (SMT): unlike the shared banks (alu_rs etc.), this module
+    // stays single-thread-scoped -- one full instance per thread (see
+    // riscv64_ooo_proc.v's header) -- so it needs no per-entry tid
+    // storage. It DOES need to know its OWN fixed thread identity,
+    // though: it now snoops the SAME shared cdbA/cdbB buses those shared
+    // banks broadcast on, and (just like them) ROB tags are only unique
+    // *within* a thread, so a numeric tag match alone isn't enough to
+    // know a broadcast is really this instance's own operand rather than
+    // the other thread's unrelated, coincidentally-same-numbered one.
+    // MY_TID is a compile-time constant (0 for the thread-0 instance, 1
+    // for thread-1's), not a per-entry runtime signal, since a given
+    // instance's thread never changes.
+    parameter MY_TID = 0
 )(
     input clk,
     input reset,
@@ -44,9 +57,18 @@ module branch_rs #(
     input [TAG_BITS-1:0] alloc_dest_tag,
     output full,
 
-    input cdb_valid,
-    input [TAG_BITS-1:0] cdb_tag,
-    input [63:0] cdb_value,
+    // Two independent CDB snoop buses -- see alu_rs.v's identical port.
+    // cdbA_tid/cdbB_tid are compared against MY_TID (above), not stored
+    // per-entry, since this instance only ever holds its own thread's
+    // entries.
+    input cdbA_valid,
+    input cdbA_tid,
+    input [TAG_BITS-1:0] cdbA_tag,
+    input [63:0] cdbA_value,
+    input cdbB_valid,
+    input cdbB_tid,
+    input [TAG_BITS-1:0] cdbB_tag,
+    input [63:0] cdbB_value,
 
     // Pulses the cycle this entry actually vacates: for a conditional
     // branch, the same cycle its operands become ready (no CDB wait --
@@ -137,13 +159,15 @@ module branch_rs #(
         if (reset) begin
             busy <= 1'b0;
         end else begin
-            if (cdb_valid) begin
-                if (busy && !s1_ready && s1_tag == cdb_tag) begin
-                    s1_ready <= 1'b1; s1_val <= cdb_value;
-                end
-                if (busy && !s2_ready && s2_tag == cdb_tag) begin
-                    s2_ready <= 1'b1; s2_val <= cdb_value;
-                end
+            if (busy && !s1_ready && cdbA_valid && cdbA_tid == MY_TID && s1_tag == cdbA_tag) begin
+                s1_ready <= 1'b1; s1_val <= cdbA_value;
+            end else if (busy && !s1_ready && cdbB_valid && cdbB_tid == MY_TID && s1_tag == cdbB_tag) begin
+                s1_ready <= 1'b1; s1_val <= cdbB_value;
+            end
+            if (busy && !s2_ready && cdbA_valid && cdbA_tid == MY_TID && s2_tag == cdbA_tag) begin
+                s2_ready <= 1'b1; s2_val <= cdbA_value;
+            end else if (busy && !s2_ready && cdbB_valid && cdbB_tid == MY_TID && s2_tag == cdbB_tag) begin
+                s2_ready <= 1'b1; s2_val <= cdbB_value;
             end
 
             if (alloc_req && !busy) begin
