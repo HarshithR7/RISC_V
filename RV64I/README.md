@@ -1437,11 +1437,38 @@ That's not a synthesis failure; LUT count is real, valid data regardless
 of whether a specific chip is big enough to hold it, and reporting it
 honestly (rather than not reporting area at all because "it doesn't fit
 iCE40") is more useful than silence. It does mean iCE40 place-and-route
-(and therefore an iCE40-specific Fmax) isn't attainable for this design;
-`RV64I/synth/synth_ecp5.ys` targets Lattice ECP5 instead (largest part,
-LFE5UM5G-85F, has ~84,000 LUTs — enough headroom to actually attempt
-placement) for a real, timing-driven Fmax, [status TBD — see the run
-command below if this document doesn't yet show a completed ECP5 result].
+(and therefore an iCE40-specific Fmax) isn't attainable for this design.
+
+### ECP5: fits, LUT-mapped, but no Fmax within this session
+
+`synth_ecp5.ys` targets Lattice ECP5 instead (largest part, LFE5UM5G-85F,
+has ~84,000 LUTs — enough headroom to actually attempt placement). ABC9
+got as far as real technology mapping at ECP5's native 7-input LUT
+granularity before this session's time budget ran out during ABC's
+internal AIG-equivalence verification step (`&verify` — checking its own
+optimized netlist still matches the original, an expensive step on a
+network this large, distinct from and after the mapping itself
+completed):
+
+| Resource | Count |
+|---|---|
+| LUTs (K=7, ECP5-native — not directly comparable to iCE40's 4-input count above) | 34,804 |
+| Dedicated carry cells (`CCU2C`) | 22,684 |
+| Hard multiplier blocks (`MULT18X18D`) | 28 |
+| Flip-flops (`TRELLIS_FF`) | ~6,148 |
+
+The lower LUT count than iCE40's 52,126 (not a contradiction) reflects
+ECP5's wider native LUTs packing more logic per LUT (average 3.97 inputs
+used per LUT, per ABC's own reported breakdown) — expected, not a
+different result for the same design. **Full place-and-route
+(`nextpnr-ecp5`) and a real Fmax were not reached**: the run was killed
+by this session's time limit during ABC's verification step, before
+`nextpnr` ever started. Rerunning `synth_ecp5.ys` with more time (the
+mapping itself, the genuinely useful part, took under 10 seconds per
+ABC's own timing — it's the equivalence-verification bookkeeping after
+that ran long) followed by `nextpnr-ecp5 --85k --json
+riscv64_synth_ecp5.json --textcfg out.config` would be the concrete next
+step to get a real, timing-driven Fmax.
 
 **Why this took tens of minutes, not seconds — a real, expected cost, not
 a stuck process:** this scoped core's divide/remainder support means
