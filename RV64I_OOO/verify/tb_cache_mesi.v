@@ -33,6 +33,11 @@ module tb_cache_mesi;
         .clk(clk), .reset(reset),
         .cpu_read_req(c0_rd_req), .cpu_read_addr(c0_rd_addr), .cpu_read_func3(c0_rd_f3),
         .cpu_read_valid(c0_rd_valid), .cpu_read_data(c0_rd_data),
+        // Phase 10 (hit-under-miss): unused by this test -- tied to
+        // defined values so an unconnected X doesn't propagate through
+        // rd2_hit into ecc_l1_sbe_fault/dbe_fault (see tb_ecc_l1.v).
+        .cpu_read2_req(1'b0), .cpu_read2_addr({ADDR_BITS{1'b0}}), .cpu_read2_func3(3'b0),
+        .cpu_read2_hit(), .cpu_read2_data(),
         .cpu_write_req(c0_wr_req), .cpu_write_addr(c0_wr_addr), .cpu_write_data(c0_wr_data),
         .cpu_write_func3(c0_wr_f3), .cpu_write_done(c0_wr_done),
         .busy(c0_busy),
@@ -61,6 +66,10 @@ module tb_cache_mesi;
         .clk(clk), .reset(reset),
         .cpu_read_req(c1_rd_req), .cpu_read_addr(c1_rd_addr), .cpu_read_func3(c1_rd_f3),
         .cpu_read_valid(c1_rd_valid), .cpu_read_data(c1_rd_data),
+        // Phase 10 (hit-under-miss): unused by this test -- see l1_core0's
+        // own tie-off above.
+        .cpu_read2_req(1'b0), .cpu_read2_addr({ADDR_BITS{1'b0}}), .cpu_read2_func3(3'b0),
+        .cpu_read2_hit(), .cpu_read2_data(),
         .cpu_write_req(c1_wr_req), .cpu_write_addr(c1_wr_addr), .cpu_write_data(c1_wr_data),
         .cpu_write_func3(c1_wr_f3), .cpu_write_done(c1_wr_done),
         .busy(c1_busy),

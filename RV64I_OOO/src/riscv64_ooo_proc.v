@@ -962,11 +962,16 @@ module riscv64_ooo_proc #(
     wire l1_read_valid; wire [63:0] l1_read_data;
     wire l1_write_req; wire [63:0] l1_write_addr, l1_write_data; wire [2:0] l1_write_func3;
     wire l1_write_done, l1_busy;
+    // Phase 10 (hit-under-miss): second, hit-only, same-cycle read port.
+    wire l1_read2_req; wire [63:0] l1_read2_addr; wire [2:0] l1_read2_func3;
+    wire l1_read2_hit; wire [63:0] l1_read2_data;
 
     l1_cache #(.LINES(L1_LINES), .LINE_BYTES(L1_LINE_BYTES), .ADDR_BITS(64)) l1_cache_i (
         .clk(clk), .reset(reset),
         .cpu_read_req(l1_read_req), .cpu_read_addr(l1_read_addr), .cpu_read_func3(l1_read_func3),
         .cpu_read_valid(l1_read_valid), .cpu_read_data(l1_read_data),
+        .cpu_read2_req(l1_read2_req), .cpu_read2_addr(l1_read2_addr), .cpu_read2_func3(l1_read2_func3),
+        .cpu_read2_hit(l1_read2_hit), .cpu_read2_data(l1_read2_data),
         .cpu_write_req(l1_write_req), .cpu_write_addr(l1_write_addr), .cpu_write_data(l1_write_data),
         .cpu_write_func3(l1_write_func3), .cpu_write_done(l1_write_done),
         .busy(l1_busy),
@@ -1002,6 +1007,8 @@ module riscv64_ooo_proc #(
         .l1_read_valid(l1_read_valid), .l1_read_data(l1_read_data),
         .l1_write_req(l1_write_req), .l1_write_addr(l1_write_addr), .l1_write_data(l1_write_data),
         .l1_write_func3(l1_write_func3), .l1_write_done(l1_write_done), .l1_busy(l1_busy),
+        .l1_read2_req(l1_read2_req), .l1_read2_addr(l1_read2_addr), .l1_read2_func3(l1_read2_func3),
+        .l1_read2_hit(l1_read2_hit), .l1_read2_data(l1_read2_data),
         .store_ready(lsq_store_ready), .store_ready_tag_flat(lsq_store_ready_tag_flat),
         .store_ready_tid_flat(lsq_store_ready_tid_flat),
         .commit_match(lsq_commit_match), .commit_fire(lsq_commit_fire), .store_buffer_full(lsq_store_buffer_full),

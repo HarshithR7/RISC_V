@@ -67,6 +67,40 @@
 // load feeds dependent instructions waiting on the CDB, a buffered
 // store's only consequence (beyond eventually landing in the cache) is
 // filling up its own buffer, a slower-forming problem.
+//
+// Phase 10 (hit-under-miss): l1_cache.v's primary port above is still
+// exactly this single-outstanding resource. What's new is an entirely
+// separate, same-cycle, hit-or-reject probe (l1_read2_*) tried
+// opportunistically whenever the primary port is occupied by something
+// else (an outstanding load miss, an outstanding store drain, or a
+// background prefetch) -- see l1_cache.v's own header for why a plain
+// hit check against its live state/tag arrays is always safe regardless
+// of what the primary port is doing. Because it's a live combinational
+// read with no request/response state of its own, trying it and missing
+// costs nothing: the same candidate (or a different one, if this one is
+// still blocked) is simply retried next cycle. A won port-2 hit
+// completes in the exact same cycle it's tried -- there is no
+// "outstanding" bookkeeping needed for it the way the primary load path
+// needs load_outstanding/outstanding_idx, since nothing about it spans
+// more than one cycle. It shares the single req_valid/tag/value CDB
+// request output with the primary load path; the primary path always
+// wins that arbitration when both want it the same cycle, since
+// l1_read_valid is a one-shot pulse from l1_cache.v's FSM that would be
+// lost forever if not consumed this exact cycle, whereas a port-2 hit's
+// underlying data is still sitting safely in the cache either way.
+//
+// Phase 10 (merging write buffer): a new store committing to the exact
+// same doubleword address as one already resident in the buffer
+// overwrites that entry in place instead of allocating a new slot --
+// the newer value supersedes the older one for that address regardless,
+// so this is a free reduction in both buffer pressure and the number of
+// l1_cache.v write transactions eventually issued. This is deliberately
+// narrower than a textbook merging write buffer's usual scope (combining
+// several *different* offsets within the same cache line into one wide
+// bus transaction): that would need l1_cache.v's write port widened to
+// accept a masked whole-line write, a bigger change than this project's
+// current write-one-doubleword-at-a-time protocol supports. Documented
+// scope line, not an oversight.
 module lsq #(
     parameter DEPTH = 4,
     parameter TAG_BITS = 3,
@@ -146,6 +180,15 @@ module lsq #(
     output [2:0] l1_write_func3,
     input l1_write_done,
     input l1_busy,
+
+    // Phase 10 (hit-under-miss): l1_cache.v's second, hit-only,
+    // same-cycle read port -- see this module's own header addendum
+    // below for how it's used.
+    output l1_read2_req,
+    output [63:0] l1_read2_addr,
+    output [2:0] l1_read2_func3,
+    input l1_read2_hit,
+    input [63:0] l1_read2_data,
 
     // Per-slot store readiness -> committable via rob.v's extra_mark
     // ports, same as Phase 1-7 -- this doesn't change: it just means
@@ -260,11 +303,13 @@ module lsq #(
                 sbuf_free_idx = sfi;
             end
     end
-    assign store_buffer_full = !sbuf_have_free;
-
     // ---- Commit-time store lookup: which resident store (if any) has
     // the exact (tid, tag) the top level says is committing this cycle
     // -- at most one match, by the ROB's own tag-uniqueness invariant.
+    // This is purely predictive (depends only on commit_lookup_tid/tag,
+    // never on commit_fire), which is what lets sbuf_merge_hit and
+    // store_buffer_full below safely consume it before commit_fire is
+    // even known this cycle.
     reg commit_match_r;
     reg [31:0] commit_idx_r;
     integer ci;
@@ -279,7 +324,40 @@ module lsq #(
         end
     end
     assign commit_match = commit_match_r;
-    wire do_commit_push = commit_fire && commit_match_r && sbuf_have_free;
+
+    // ---- Phase 10: merging write buffer -- does a resident, not-yet-
+    // draining entry already cover the EXACT same (address, width) as
+    // the store about to commit? Only an exact match is safe to collapse
+    // in place (see this module's header addendum for why a width
+    // mismatch can't just overwrite the old entry -- it could shrink the
+    // covered byte range and silently lose part of the older write).
+    // store_draining's own in-flight entry is deliberately excluded: it
+    // may already be mid-handshake at l1_cache.v this exact cycle, so
+    // mutating its data out from under that request is unsafe -- let it
+    // finish; the new store simply gets its own fresh slot instead, same
+    // as before this feature existed.
+    reg sbuf_merge_hit;
+    reg [31:0] sbuf_merge_idx;
+    integer mi;
+    always @(*) begin
+        sbuf_merge_hit = 1'b0;
+        sbuf_merge_idx = 0;
+        for (mi = 0; mi < SBUF_DEPTH; mi = mi + 1) begin
+            if (sbuf_valid[mi] && !(store_draining && draining_idx == mi) &&
+                sbuf_tid[mi] == tid_arr[commit_idx_r] &&
+                sbuf_addr[mi] == entry_addr[commit_idx_r] &&
+                sbuf_func3[mi] == func3[commit_idx_r]) begin
+                sbuf_merge_hit = 1'b1;
+                sbuf_merge_idx = mi;
+            end
+        end
+    end
+
+    // A merge in place doesn't need a free slot at all -- it's reusing
+    // an existing one -- so store_buffer_full (sbuf_have_free) must not
+    // gate this path the way it gates a genuinely new allocation.
+    assign store_buffer_full = !sbuf_have_free && !(commit_match_r && sbuf_merge_hit);
+    wire do_commit_push = commit_fire && commit_match_r && (sbuf_have_free || sbuf_merge_hit);
 
     // ---- Disambiguation: which load slots are blocked by an older,
     // still-resident store this cycle, *or* by a same-thread store
@@ -359,6 +437,40 @@ module lsq #(
     reg store_draining;
     reg [31:0] draining_idx;
 
+    // ---- Phase 10: opportunistic second-load candidate (hit-under-
+    // miss). Tried only while the primary port is occupied by something
+    // else this cycle -- when it's free, everything goes through the
+    // primary issue_load path below as always, since there's no benefit
+    // to routing through the same-cycle hit-only probe instead of the
+    // primary path's own fully general one. Excludes whichever slot is
+    // already the primary path's own in-flight load (outstanding_idx),
+    // and reuses the same blocked[]/base_ready[] readiness check issue_load
+    // uses -- l1_read2_hit (from l1_cache.v, purely combinational) is
+    // this cycle's actual pass/fail verdict; if it misses, nothing is
+    // committed and the same or a different candidate is simply retried
+    // next cycle.
+    wire primary_occupied = l1_busy || load_outstanding || store_draining;
+    integer r2;
+    reg have_ready2;
+    reg [31:0] ready_idx2;
+    always @(*) begin
+        have_ready2 = 1'b0;
+        ready_idx2 = 0;
+        if (primary_occupied) begin
+            for (r2 = DEPTH - 1; r2 >= 0; r2 = r2 - 1)
+                if (busy[r2] && !is_store_arr[r2] && base_ready[r2] && !blocked[r2] &&
+                    !(load_outstanding && outstanding_idx == r2)) begin
+                    have_ready2 = 1'b1;
+                    ready_idx2 = r2;
+                end
+        end
+    end
+
+    assign l1_read2_req   = have_ready2;
+    assign l1_read2_addr  = entry_addr[ready_idx2];
+    assign l1_read2_func3 = func3[ready_idx2];
+    wire port2_fire = have_ready2 && l1_read2_hit;
+
     wire issue_load  = have_ready;
     wire drain_store = !l1_busy && !load_outstanding && !issue_load && !store_draining && sbuf_valid[sbuf_drain_idx];
 
@@ -392,10 +504,19 @@ module lsq #(
     // the meantime (outstanding_squashed) -- a squashed load's response
     // is silently discarded, never broadcast onto a tag that may since
     // have been reused by an unrelated instruction.
-    assign req_valid = load_outstanding && l1_read_valid && !outstanding_squashed;
-    assign req_tid    = outstanding_tid;
-    assign req_tag    = outstanding_tag;
-    assign req_value  = l1_read_data;
+    //
+    // Phase 10: the primary path's own pulse ALWAYS wins this single CDB
+    // request port when both want it the same cycle -- l1_read_valid is
+    // a one-shot pulse from l1_cache.v's FSM (fsm returns to ST_IDLE the
+    // very next cycle either way) that would be lost forever if not
+    // consumed exactly this cycle, whereas port2_fire's underlying data
+    // is a live combinational read that's still sitting safely in the
+    // cache if it has to wait one more cycle for the port.
+    wire primary_fire = load_outstanding && l1_read_valid && !outstanding_squashed;
+    assign req_valid = primary_fire || port2_fire;
+    assign req_tid    = primary_fire ? outstanding_tid : tid_arr[ready_idx2];
+    assign req_tag    = primary_fire ? outstanding_tag : dest_tag[ready_idx2];
+    assign req_value  = primary_fire ? l1_read_data : l1_read2_data;
 
     // ---- Per-slot store readiness (address + data both known). tid is
     // exposed alongside the tag (Phase 7) so the top level can route each
@@ -484,16 +605,36 @@ module lsq #(
                 busy[outstanding_idx] <= 1'b0;
             end
 
+            // Phase 10: a won port-2 hit completes in the same cycle it's
+            // tried -- no "outstanding" state needed, just free the slot
+            // the moment the CDB request actually wins arbitration. If it
+            // ISN'T granted this cycle, busy[ready_idx2] stays set and
+            // the same (or by-then a different) candidate is naturally
+            // reconsidered next cycle -- no data was ever at risk, unlike
+            // the primary path's one-shot l1_read_valid pulse.
+            if (req_valid && req_grant && !primary_fire) begin
+                busy[ready_idx2] <= 1'b0;
+            end
+
             // Push a committing store into the buffer (address already
             // resolved -- entry_addr is combinational off base_val+imm,
             // both of which store_ready already required to be known).
+            // Phase 10: an exact (addr, width) match against an existing
+            // entry collapses into that entry's slot instead of consuming
+            // a new one -- see sbuf_merge_hit's own comment for why this
+            // is always safe (only a bit-for-bit identical footprint ever
+            // merges, and a mid-drain entry is excluded).
             if (do_commit_push) begin
                 busy[commit_idx_r] <= 1'b0;
-                sbuf_valid[sbuf_free_idx] <= 1'b1;
-                sbuf_tid[sbuf_free_idx]   <= tid_arr[commit_idx_r];
-                sbuf_addr[sbuf_free_idx]  <= entry_addr[commit_idx_r];
-                sbuf_data[sbuf_free_idx]  <= data_val[commit_idx_r];
-                sbuf_func3[sbuf_free_idx] <= func3[commit_idx_r];
+                if (sbuf_merge_hit) begin
+                    sbuf_data[sbuf_merge_idx] <= data_val[commit_idx_r];
+                end else begin
+                    sbuf_valid[sbuf_free_idx] <= 1'b1;
+                    sbuf_tid[sbuf_free_idx]   <= tid_arr[commit_idx_r];
+                    sbuf_addr[sbuf_free_idx]  <= entry_addr[commit_idx_r];
+                    sbuf_data[sbuf_free_idx]  <= data_val[commit_idx_r];
+                    sbuf_func3[sbuf_free_idx] <= func3[commit_idx_r];
+                end
             end
 
             // Issue a new outstanding store-buffer drain, latching which

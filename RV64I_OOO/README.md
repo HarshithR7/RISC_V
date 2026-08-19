@@ -12,11 +12,12 @@ RV64IMACFD+RVV feature set.
 
 ## Status
 
-**Phases 1 through 9 are all complete: 33/33 single-core full-pipeline
+**Phases 1 through 10 are all complete: 33/33 single-core full-pipeline
 tests pass, plus a dedicated 2-core coherency test**, plus 21/21 isolated
 ROB+RAT unit-test checks, 15/15 standalone divider unit tests, 13/13
-isolated L1/L2 MESI coherency checks, 2/2 lockstep DMR checks, and 6/6
-isolated ECC checks.
+isolated L1/L2 MESI coherency checks, 2/2 lockstep DMR checks, 6/6
+isolated ECC checks, and 3/3 isolated Phase 10 memory-optimization
+checks (prefetch, hit-under-miss, merging write buffer).
 
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
@@ -53,6 +54,13 @@ isolated ECC checks.
   below. Second, real SECDED ECC (single-error-correct, double-error-
   detect) on the register file, L1, L2, and ROB payload storage — see
   "Phase 9 continued: ECC on memory structures" below.
+- **Phase 10**: memory-hierarchy optimizations cross-referenced directly
+  against Hennessy & Patterson's own cache-optimization and CPI-reducing-
+  technique taxonomies — a hardware next-line prefetcher, hit-under-miss
+  (independent cache hits complete while a miss is outstanding, instead
+  of the whole pipeline stalling on it), and a real merging write buffer
+  — see "Phase 10: memory-hierarchy optimizations" below for what's
+  covered, what's a documented non-goal, and why.
 
 Tests cover RAW/WAR/WAW hazards (including intra-group ones specific to
 2-wide dispatch), a real backward-branch loop (which, as a side effect of
@@ -1277,4 +1285,129 @@ single-bit test intended. Documented inline in both `tb_lockstep.v` and
 33/33 single-core, plus the dual-core coherency test, plus 13/13
 isolated MESI checks, plus 21/21 isolated ROB+RAT checks, plus 2/2
 lockstep DMR checks, plus 6/6 isolated ECC checks (`ecc64`, `ecc_line`,
-register file, L1, L2, ROB).
+register file, L1, L2, ROB), plus 3/3 isolated Phase 10 checks
+(prefetch, hit-under-miss, merging write buffer).
+
+## Phase 10: memory-hierarchy optimizations
+
+Prompted by cross-referencing the actual design against two standard
+textbook taxonomies (Hennessy & Patterson's "10 advanced cache
+optimizations" and its CPI-reducing-technique list): the ILP/scheduling
+side already covered essentially every hardware-relevant technique in
+the second list (forwarding, dynamic scheduling with renaming, branch
+prediction, hardware speculation, dynamic memory disambiguation,
+multi-issue — the only gaps were compiler-side techniques, out of scope
+for a project with no real compiler, and delayed branches, an obsolete
+technique real dynamic prediction supersedes). The cache side had real,
+addressable gaps: this phase closes the highest-value ones.
+
+- **Hardware next-line prefetcher** (`l1_cache.v`): on a genuine DEMAND
+  read miss's fill completing, the FSM arms exactly one line of
+  lookahead (`prefetch_pending`/`prefetch_addr`, the next line's base
+  address). It only ever fires on an otherwise-idle cycle (every
+  CPU-request branch in the FSM's `ST_IDLE` case takes priority, so a
+  prefetch never delays real work), and only into a set that's already
+  Invalid or holds a clean (S/E) line — it never triggers an eviction
+  writeback purely on speculation. A prefetch fill reuses the exact same
+  `op_*`/`l2_req_*` machinery a demand miss already uses, tagged with a
+  new `is_prefetch` bit so it never asserts `cpu_read_valid` for a
+  request the CPU never made. A prefetch fill never itself arms another
+  prefetch (only a genuine demand fill does) — deliberately one block of
+  lookahead, not a runaway chain racing ahead of the access pattern.
+  Verified in `tb_prefetch.v`: after a demand miss to line 0 with nothing
+  else requested, line 1 becomes resident with zero CPU-visible activity,
+  and a subsequent real demand read to line 1 completes in exactly one
+  busy cycle with zero L2 traffic — the actual latency win, not just a
+  state/tag check.
+
+- **Hit-under-miss** (`l1_cache.v` + `lsq.v`): the primary FSM is still
+  exactly as single-outstanding and blocking as before — that invariant
+  (an in-flight miss's own set is forced Invalid the instant the miss
+  starts) is exactly what makes it safe to add a second, purely
+  combinational, read-only CPU port (`cpu_read2_*`) that reports a hit or
+  miss the same cycle it's asked, on any OTHER set, regardless of what
+  the primary FSM is doing. `lsq.v` tries this port opportunistically
+  whenever the primary port is occupied (an outstanding load miss, a
+  store-buffer drain, or a background prefetch) with an independent,
+  unblocked, ready load — a miss on this port costs nothing (no FSM
+  state is ever allocated for it), so it's simply retried next cycle,
+  possibly with a different candidate. It shares the LSQ's single
+  CDB-request output with the primary load path; the primary path always
+  wins that arbitration, since `l1_read_valid` is a one-shot pulse that
+  would be lost forever if not consumed the exact cycle it fires, whereas
+  a port-2 hit's data is still safely sitting in the cache if it has to
+  wait one more cycle. This is deliberately scoped to hit-under-miss, not
+  full miss-under-miss: a second genuine miss still has to wait for the
+  first to finish, same as before this phase. Verified in
+  `tb_hit_under_miss.v`: while a real, independent multi-cycle miss on
+  one line is outstanding through the primary port, a different resident
+  line is probed through the second port on every single cycle of that
+  window and hits with correct data every time, without perturbing the
+  primary miss's own progress — plus a baseline check that the second
+  port correctly rejects a probe of a line that genuinely isn't resident.
+
+- **Merging write buffer** (`lsq.v`): a store committing to the exact
+  same address *and* width as an entry already resident in the store
+  buffer collapses into that entry in place (`sbuf_merge_hit`) instead of
+  consuming a new slot — the newer value supersedes the older one for
+  that address regardless, so this is a free reduction in both buffer
+  pressure and the number of `l1_cache.v` write transactions eventually
+  issued. Only an *exact* (address, width) match ever merges — a width
+  mismatch could shrink the covered byte range and silently lose part of
+  an older write, so it isn't attempted. An entry that's already mid-
+  drain (`store_draining`) is excluded from merge candidacy, since it may
+  already be mid-handshake at `l1_cache.v` that exact cycle. This is
+  deliberately narrower than a textbook merging write buffer's usual
+  scope (combining several *different* offsets within the same cache
+  line into one wide bus transaction) — that would need `l1_cache.v`'s
+  write port widened to accept a masked whole-line write, a bigger change
+  than this project's current write-one-doubleword-at-a-time protocol
+  supports. A documented scope line, not an oversight. `store_buffer_full`
+  is updated to account for this: a store that would merge doesn't need a
+  free slot, so a full buffer no longer unnecessarily blocks it. Verified
+  in `tb_merge_wbuf.v`: two stores to the same address+width with
+  different data, committed one after another, land in exactly one
+  buffer slot holding the second (newer, correct) value — not two slots,
+  and not the stale first value.
+
+- **Critical word first / early restart**: examined, and found to already
+  be effectively achieved by this design's existing memory interface, not
+  a gap needing new machinery. `l2_cache.v` fetches a whole line from
+  `data_memory.v` in a single wide access (reusing the RVV vector port,
+  not a serialized burst this design ever models), and `l1_cache.v`
+  already extracts the CPU's requested word in the *same* cycle the line
+  lands (`read_data_r <= extract_read(op_write_value, ...)` right
+  alongside `line[op_idx] <= op_write_value` in `ST_WAIT`) — there is no
+  artificial delay waiting for "the rest of the line" the way a real
+  serialized DRAM burst would impose, since there's no serialization to
+  restart early from in the first place. Building fake burst-timing
+  machinery purely to have something to reorder would be complexity
+  without a corresponding benefit at this design's abstraction level.
+
+- **Not attempted (real, honest gaps)**: banked caches and true
+  pipelined cache access (accepting a new request every cycle while a
+  previous one is still completing) are NOT implemented. Both would
+  require a materially larger rework than this phase's other three
+  items — banked caches need genuinely parallel bank access paths with
+  their own arbitration, and pipelined access needs the blocking FSM
+  itself restructured into distinct always-progressing pipeline stages,
+  touching the same timing-sensitive territory Phase 8/9's MESI/ECC/
+  lockstep work depends on being simple to reason about serially. Left as
+  a real, scoped-out gap rather than a rushed, undertested rewrite of a
+  currently fully-working and fully-verified cache subsystem.
+
+- **Zero regressions**: the full pre-existing suite -- 33/33 single-core,
+  the dual-core coherency test, 13/13 isolated MESI checks, 21/21
+  isolated ROB+RAT checks, 6/6 isolated ECC checks, both lockstep DMR
+  checks, and all 6 benchmarks (identical cycle counts to before this
+  phase, since none of the benchmarks are memory-heavy enough to exercise
+  these new paths) -- passes unchanged. One real backward-compatibility
+  fix was needed along the way: `l1_cache.v` gained new mandatory input
+  ports (`cpu_read2_*`) for the second port, and any pre-existing
+  testbench instantiating it directly (`tb_ecc_l1.v`, `tb_cache_mesi.v`)
+  needed those tied to defined values -- left floating, an X-valued
+  `cpu_read2_addr` would index `line[]`/`tag[]` with an X index, and X
+  would propagate through `rd2_hit` into `ecc_l1_sbe_fault`/`dbe_fault`
+  (a same-cycle OR term), turning those tests' exact-equality fault
+  checks into false failures. Caught by actually running the full suite
+  after the change, not assumed safe.

@@ -37,6 +37,14 @@ module tb_ecc_l1;
         .clk(clk), .reset(reset),
         .cpu_read_req(rd_req), .cpu_read_addr(rd_addr), .cpu_read_func3(rd_f3),
         .cpu_read_valid(rd_valid), .cpu_read_data(rd_data),
+        // Phase 10 (hit-under-miss): this test doesn't exercise the
+        // second port, but it must still be tied to defined values --
+        // left floating, an X-valued cpu_read2_addr would index line[]/
+        // tag[] with an X index, and X would propagate through rd2_hit
+        // into ecc_l1_sbe_fault/dbe_fault (a same-cycle OR term), turning
+        // this test's exact-equality fault checks into false failures.
+        .cpu_read2_req(1'b0), .cpu_read2_addr({ADDR_BITS{1'b0}}), .cpu_read2_func3(3'b0),
+        .cpu_read2_hit(), .cpu_read2_data(),
         .cpu_write_req(wr_req), .cpu_write_addr(wr_addr), .cpu_write_data(wr_data),
         .cpu_write_func3(wr_f3), .cpu_write_done(wr_done),
         .busy(busy),

@@ -35,6 +35,36 @@
 // this module needing to reason about a new, not-yet-installed line being
 // snoop-visible before its own fill completes -- a deliberate, documented
 // simplification, not an oversight.
+//
+// Phase 10 (hit-under-miss + next-line prefetch): the primary FSM above
+// is still single-outstanding and blocking exactly as described -- that
+// part didn't change. What's new is a second, purely combinational,
+// read-only CPU port (cpu_read2_*) that can report a hit on any OTHER
+// set while the primary FSM is busy with something else (a miss fill, a
+// store-buffer drain, or a background prefetch): since a miss/write-miss
+// always force-invalidates its own set's state[] the same cycle it
+// starts (see above), and a prefetch (below) never touches a set that
+// isn't already safely Invalid, the second port's plain
+// `state[idx]!=I && tag[idx]==tag` check is automatically correct against
+// whatever the primary FSM is doing, with one documented exception (a
+// BusUpgr merge leaves its set's state at S for the whole transaction --
+// safe only because lsq.v's own store-buffer disambiguation guarantees
+// no load to that same address can reach this port during that window;
+// see the port's own comment below). This turns "one outstanding miss"
+// into real hit-under-miss: independent hits keep completing while a
+// miss is in flight, at the cost of NOT supporting miss-under-miss (a
+// second miss still has to wait for the first to finish, same as today).
+//
+// The next-line prefetcher piggybacks on the exact same primary-FSM
+// machinery a demand miss already uses (same op_*/l2_req_* registers,
+// same ST_WAIT fill path), tagged with a new `is_prefetch` bit so it
+// never asserts cpu_read_valid or disturbs read_data_r. It only ever
+// fires when the CPU has nothing to submit this cycle (so it never
+// delays real work) and only into a set that's already safely empty or
+// clean (never triggers an eviction writeback purely on speculation), and
+// only ever looks one line ahead of a genuine DEMAND miss -- a prefetch
+// fill never itself arms another prefetch, so there's no runaway chain
+// racing ahead of the access pattern.
 module l1_cache #(
     parameter LINES = 16,       // direct-mapped: also the number of sets
     parameter LINE_BYTES = 32,  // 4 doublewords per line
@@ -49,6 +79,20 @@ module l1_cache #(
     input [2:0] cpu_read_func3,
     output cpu_read_valid,      // pulses exactly once per accepted request
     output [63:0] cpu_read_data,
+
+    // ---- CPU-side second (hit-only) read port (Phase 10: hit-under-miss)
+    // Purely combinational: reports hit/miss the same cycle it's asked,
+    // never allocates any FSM state of its own, and therefore costs
+    // nothing to try even when it misses. Lets lsq.v opportunistically
+    // complete an independent load while the primary port above is
+    // occupied servicing an outstanding miss, a prefetch, or a store-
+    // buffer drain -- see the ECC section below for why this is always
+    // safe against whatever the primary port is doing that same cycle.
+    input cpu_read2_req,
+    input [ADDR_BITS-1:0] cpu_read2_addr,
+    input [2:0] cpu_read2_func3,
+    output cpu_read2_hit,
+    output [63:0] cpu_read2_data,
 
     // ---- CPU-side store-buffer drain port ------------------------------
     input cpu_write_req,
@@ -175,7 +219,10 @@ module l1_cache #(
     reg [TAG_BITS-1:0] op_tag;
 
     assign busy = (fsm != ST_IDLE);
-    assign cpu_read_valid = (fsm == ST_DONE_R);
+    // A prefetch fill reaches ST_DONE_R exactly like a demand fill, but
+    // must never be mistaken by the CPU for the response to a request it
+    // never made -- see the header addendum on is_prefetch.
+    assign cpu_read_valid = (fsm == ST_DONE_R) && !is_prefetch;
     assign cpu_write_done = (fsm == ST_DONE_W);
 
     reg [63:0] read_data_r;
@@ -190,6 +237,31 @@ module l1_cache #(
     wire wr_hit_m_or_e = (state[wr_idx] != I) && (tag[wr_idx] == wr_tag) &&
                           (state[wr_idx] == M || state[wr_idx] == E);
     wire wr_hit_s      = (state[wr_idx] != I) && (tag[wr_idx] == wr_tag) && (state[wr_idx] == S);
+
+    // ---- Phase 10: second read-only port (hit-under-miss) --------------
+    // See the module header addendum above for why a plain state/tag
+    // check against the live arrays is always safe here, primary FSM
+    // activity notwithstanding.
+    wire [IDX_BITS-1:0] rd2_idx = cpu_read2_addr[IDX_BITS+OFF_BITS-1:OFF_BITS];
+    wire [TAG_BITS-1:0] rd2_tag = cpu_read2_addr[ADDR_BITS-1:IDX_BITS+OFF_BITS];
+    wire rd2_hit = cpu_read2_req && (state[rd2_idx] != I) && (tag[rd2_idx] == rd2_tag);
+    wire [LINE_BYTES*8-1:0] rd2_line_corrected;
+    wire rd2_line_sbe, rd2_line_dbe;
+    ecc_line #(.LINE_BYTES(LINE_BYTES)) ecc_rd2_i (
+        .wr_line({LINE_BYTES*8{1'b0}}), .wr_check(),
+        .rd_line(line[rd2_idx]), .rd_check(line_check[rd2_idx]),
+        .rd_line_corrected(rd2_line_corrected), .rd_sbe(rd2_line_sbe), .rd_dbe(rd2_line_dbe)
+    );
+    assign cpu_read2_hit  = rd2_hit;
+    assign cpu_read2_data = extract_read(rd2_line_corrected, cpu_read2_addr, cpu_read2_func3);
+
+    // ---- Phase 10: next-line prefetch state -----------------------------
+    reg prefetch_pending;
+    reg [ADDR_BITS-1:0] prefetch_addr;
+    reg is_prefetch;
+    wire [IDX_BITS-1:0] pf_idx = prefetch_addr[IDX_BITS+OFF_BITS-1:OFF_BITS];
+    wire [TAG_BITS-1:0] pf_tag = prefetch_addr[ADDR_BITS-1:IDX_BITS+OFF_BITS];
+    wire pf_already_resident = (state[pf_idx] != I) && (tag[pf_idx] == pf_tag);
 
     // ---- Phase 9 (ECC): one decode/encode instance per named access
     // point (rd_idx, wr_idx, op_idx, snoop_idx). rd_idx and wr_idx get
@@ -273,9 +345,13 @@ module l1_cache #(
     // consume a corrected value, so the flag is already stable by the
     // time the corresponding DONE state (and cpu_read_valid/
     // cpu_write_done) is reached one cycle later.
+    // Port 2's fault contribution is combinational too, for the same
+    // reason the snoop path's is: it's a same-cycle hit-or-nothing check,
+    // never a multi-cycle transaction whose completion a caller has to
+    // poll for later.
     reg access_sbe, access_dbe;
-    assign ecc_l1_sbe_fault = access_sbe || (snoop_req_valid && snoop_resp_hit && snoop_line_sbe);
-    assign ecc_l1_dbe_fault = access_dbe || (snoop_req_valid && snoop_resp_hit && snoop_line_dbe);
+    assign ecc_l1_sbe_fault = access_sbe || (snoop_req_valid && snoop_resp_hit && snoop_line_sbe) || (rd2_hit && rd2_line_sbe);
+    assign ecc_l1_dbe_fault = access_dbe || (snoop_req_valid && snoop_resp_hit && snoop_line_dbe) || (rd2_hit && rd2_line_dbe);
 
     always @(posedge clk or posedge reset) begin
         if (reset) begin
@@ -283,6 +359,8 @@ module l1_cache #(
             l2_req_valid <= 1'b0;
             access_sbe <= 1'b0;
             access_dbe <= 1'b0;
+            prefetch_pending <= 1'b0;
+            is_prefetch <= 1'b0;
             for (li = 0; li < LINES; li = li + 1) begin
                 state[li] <= I;
                 line_check[li] <= {LINE_BYTES{1'b0}};
@@ -303,9 +381,11 @@ module l1_cache #(
                     if (cpu_read_req && rd_hit) begin
                         read_data_r <= extract_read(rd_line_corrected, cpu_read_addr, cpu_read_func3);
                         access_sbe <= rd_line_sbe; access_dbe <= rd_line_dbe;
+                        is_prefetch <= 1'b0;
                         fsm <= ST_DONE_R;
                     end else if (cpu_read_req && !rd_hit) begin
                         is_write_op <= 1'b0;
+                        is_prefetch <= 1'b0;
                         op_addr <= cpu_read_addr; op_func3 <= cpu_read_func3;
                         op_idx <= rd_idx; op_tag <= rd_tag;
                         if (state[rd_idx] == M) begin
@@ -352,6 +432,23 @@ module l1_cache #(
                             l2_req_addr <= cpu_write_addr;
                             fsm <= ST_WAIT;
                         end
+                    end else if (prefetch_pending) begin
+                        // Only reached when the CPU asked for nothing this
+                        // cycle (every branch above requires cpu_read_req
+                        // or cpu_write_req) -- a prefetch never delays real
+                        // work. See header addendum: never evict a dirty
+                        // line, and never re-fetch something already here.
+                        prefetch_pending <= 1'b0;
+                        if (!pf_already_resident && state[pf_idx] != M) begin
+                            state[pf_idx] <= I;
+                            is_prefetch <= 1'b1;
+                            is_write_op <= 1'b0;
+                            op_addr <= prefetch_addr; op_func3 <= 3'b011;
+                            op_idx <= pf_idx; op_tag <= pf_tag;
+                            l2_req_valid <= 1'b1; l2_req_type <= REQ_BUSRD;
+                            l2_req_addr <= prefetch_addr;
+                            fsm <= ST_WAIT;
+                        end
                     end
                 end
 
@@ -395,6 +492,15 @@ module l1_cache #(
                             state[op_idx] <= l2_resp_exclusive ? E : S;
                             read_data_r <= extract_read(op_write_value, op_addr, op_func3);
                             access_sbe <= 1'b0; access_dbe <= 1'b0;
+                            // Arm exactly one line of lookahead off a real
+                            // DEMAND fill only -- a prefetch fill never
+                            // arms another prefetch (see header addendum:
+                            // no runaway chain racing ahead of the access
+                            // pattern).
+                            if (!is_prefetch) begin
+                                prefetch_pending <= 1'b1;
+                                prefetch_addr <= {op_tag, op_idx, {OFF_BITS{1'b0}}} + LINE_BYTES;
+                            end
                             fsm <= ST_DONE_R;
                         end
                     end
