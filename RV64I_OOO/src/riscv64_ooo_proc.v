@@ -128,10 +128,57 @@
 //     lsq.v cross-thread-memory scope note above (which only makes sense
 //     if the two threads' loads/stores land in the same address space).
 //
-// Reused unchanged from the single-cycle RV64I core: program_counter.v,
-// instruction_fetch.v. The architectural register file (written only at
-// commit) is Phase 9's ecc_register_file.v, an ECC-protected drop-in for
-// register_file.v -- see that file's own header.
+// Reused unchanged from the single-cycle RV64I core: program_counter.v.
+// The architectural register file (written only at commit) is Phase 9's
+// ecc_register_file.v, an ECC-protected drop-in for register_file.v --
+// see that file's own header.
+//
+// Phase 11 (FPGA bring-up: registered fetch): instruction_fetch.v itself
+// is still reused unmodified, but every instantiation now goes through
+// instruction_fetch_reg.v, a 1-cycle-latency wrapper -- real Xilinx Block
+// RAM has no combinational-read mode at this design's instruction-memory
+// size, and distributed RAM (the one primitive that could do a same-
+// cycle read) doesn't scale to it without burning a large fraction of a
+// mid-size FPGA's fabric on storage alone. Simulation-only targets
+// (every existing testbench) still run this same RTL -- it's simply a
+// slower, more realistic core now, not a separate hardware-only variant.
+//
+// This one-cycle latency ripples into exactly two places, both handled
+// here: (1) a new t0_pc_latched/t1_pc_latched register, paired 1:1 with
+// instruction_fetch_reg's own internal register (both are clocked off
+// the SAME live t0_pc/t1_pc value each cycle, so they always arrive back
+// in lockstep) -- every downstream consumer of "the PC of the
+// instruction currently being decoded" (the muxed pc/pc1 wires feeding
+// branch_rs.v's alloc_pc, bht.v's predict_pc, AUIPC's src1_is_pc operand,
+// and this thread's own JAL/predicted-branch target computation) reads
+// the LATCHED copy, never the live t0_pc/t1_pc register directly -- by
+// the time decode is looking at a given instruction, the live PC
+// register has already moved on to requesting the NEXT one. The one
+// deliberate exception is the PC-hold case (dispatch didn't fire this
+// cycle -- not this thread's turn, or a structural stall): that's a
+// decision about what the FETCH stage should keep requesting, not about
+// the decoded instruction's own PC, so it correctly still reads the live
+// t0_pc/t1_pc register (self-referential hold: keep re-requesting the
+// same address).
+// (2) t0_fetch_valid/t1_fetch_valid: straight-line/JAL/predicted-branch
+// redirects are safe with no extra handling -- they only ever change
+// live PC on this thread's OWN dispatch turn, and Phase 7's SMT
+// round-robin already guarantees a full idle cycle (the other thread's
+// turn) before this thread dispatches again, which exactly absorbs the
+// one cycle of fetch latency for free. Misprediction/JALR-resolution
+// redirects are NOT covered by that slack -- they fire asynchronously,
+// from execution resolving, on whatever cycle that happens to land on,
+// independent of whose dispatch turn it is. Without a real fetch-valid
+// bit, the ONE fetch already in flight from before such a redirect (a
+// stale, wrong-path instruction) would land in t0_instruction0/1 exactly
+// one cycle later and could be decoded and dispatched as if it were
+// real. t0_fetch_valid is registered as `!t0_redirect_needed` each
+// cycle: a redirect firing during cycle K correctly marks the fetch
+// arriving at K+1 (issued during K, before the redirect's effect on PC
+// took hold) as invalid, gates it out of lane0_fire for that one bubble
+// cycle, and clears on its own the cycle after (K+2), by which point the
+// live PC register has been holding steady at the real redirect target
+// since K+1 and the correct instruction has landed.
 module riscv64_ooo_proc #(
     // Phase 7: one program image per thread -- see module header for why
     // this replaced Phase 1-6's single IMEM_FILE.
@@ -224,14 +271,29 @@ module riscv64_ooo_proc #(
     reg  [63:0] t0_next_pc;
     wire [31:0] t0_instruction0, t0_instruction1;
 
+    // Phase 11: paired with instruction_fetch_reg's own 1-cycle latency
+    // -- see this file's header addendum.
+    reg [63:0] t0_pc_latched;
+    wire [63:0] t0_pc1_latched = t0_pc_latched + 64'd4;
+    reg t0_fetch_valid;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            t0_pc_latched <= 64'b0;
+            t0_fetch_valid <= 1'b0;
+        end else begin
+            t0_pc_latched <= t0_pc;
+            t0_fetch_valid <= !t0_redirect_needed;
+        end
+    end
+
     program_counter t0_pc_module (.clk(clk), .reset(reset), .pc_in(t0_next_pc), .pc_out(t0_pc));
-    instruction_fetch #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS)) t0_if0 (
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS)) t0_if0 (
         .clk(clk), .pc(t0_pc), .instruction(t0_instruction0)
     );
-    instruction_fetch #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS)) t0_if1 (
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS)) t0_if1 (
         .clk(clk), .pc(t0_pc1), .instruction(t0_instruction1)
     );
-    assign pc_out0 = t0_pc;
+    assign pc_out0 = t0_pc_latched;
 
     wire [4:0] t0_d0_rs1, t0_d0_rs2, t0_d0_rd;
     wire [2:0] t0_d0_func3;
@@ -285,14 +347,28 @@ module riscv64_ooo_proc #(
     reg  [63:0] t1_next_pc;
     wire [31:0] t1_instruction0, t1_instruction1;
 
+    // Phase 11: mirrors t0's own latch/valid pair above.
+    reg [63:0] t1_pc_latched;
+    wire [63:0] t1_pc1_latched = t1_pc_latched + 64'd4;
+    reg t1_fetch_valid;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            t1_pc_latched <= 64'b0;
+            t1_fetch_valid <= 1'b0;
+        end else begin
+            t1_pc_latched <= t1_pc;
+            t1_fetch_valid <= !t1_redirect_needed;
+        end
+    end
+
     program_counter t1_pc_module (.clk(clk), .reset(reset), .pc_in(t1_next_pc), .pc_out(t1_pc));
-    instruction_fetch #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS)) t1_if0 (
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS)) t1_if0 (
         .clk(clk), .pc(t1_pc), .instruction(t1_instruction0)
     );
-    instruction_fetch #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS)) t1_if1 (
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS)) t1_if1 (
         .clk(clk), .pc(t1_pc1), .instruction(t1_instruction1)
     );
-    assign pc_out1 = t1_pc;
+    assign pc_out1 = t1_pc_latched;
 
     wire [4:0] t1_d0_rs1, t1_d0_rs2, t1_d0_rd;
     wire [2:0] t1_d0_func3;
@@ -349,8 +425,14 @@ module riscv64_ooo_proc #(
     // 1-6's dispatch logic already used -- so that logic (further below)
     // is reused completely unchanged, just now consuming a per-cycle
     // muxed view instead of a single thread's own wires.
-    wire [63:0] pc      = active_thread ? t1_pc      : t0_pc;
-    wire [63:0] pc1     = active_thread ? t1_pc1     : t0_pc1;
+    // Phase 11: "the PC of the instruction currently being decoded" --
+    // must be the LATCHED copy (paired with the also-latched
+    // t0/t1_instruction0/1), not the live t0_pc/t1_pc register, which by
+    // now has already moved on to requesting the next fetch. See this
+    // file's header addendum.
+    wire [63:0] pc      = active_thread ? t1_pc_latched      : t0_pc_latched;
+    wire [63:0] pc1     = active_thread ? t1_pc1_latched     : t0_pc1_latched;
+    wire fetch_valid    = active_thread ? t1_fetch_valid     : t0_fetch_valid;
 
     wire [4:0] d0_rs1 = active_thread ? t1_d0_rs1 : t0_d0_rs1;
     wire [4:0] d0_rs2 = active_thread ? t1_d0_rs2 : t0_d0_rs2;
@@ -1277,8 +1359,14 @@ module riscv64_ooo_proc #(
                                  (d0_is_div && div_rs_full) ||
                                  ((d0_is_load || d0_is_store) && lsq_full) ||
                                  (d0_is_vec && vec_rs_full);
+    // Phase 11: fetch_valid gates out the one bubble cycle following a
+    // misprediction/JALR redirect (see this file's header addendum) --
+    // without it, the stale, wrong-path fetch already in flight from
+    // before the redirect would be decoded and dispatched as if real.
+    // lane1_fire already depends on lane0_fire, so gating here alone is
+    // enough for both lanes.
     wire lane0_fire = lane0_dispatchable && (rob_free_count >= 1) && !lane0_needed_rs_full &&
-                       !jalr_outstanding && !mispredict && !lane0_vmv_stall;
+                       !jalr_outstanding && !mispredict && !lane0_vmv_stall && fetch_valid;
 
     wire lane0_breaks_flow = d0_is_jal || d0_is_jalr || (d0_is_branch && bht_predict_taken);
     wire lane1_dispatchable = d1_is_alu || d1_is_mul || d1_is_div || d1_is_load || d1_is_store;
@@ -1378,27 +1466,36 @@ module riscv64_ooo_proc #(
     // ---- whose dispatch turn it is; straight-line advance / JAL / -------
     // ---- predicted-taken redirect only on this thread's own turn --------
     always @(*) begin
+        // Phase 11: every branch below that redirects based on THIS
+        // cycle's decoded instruction (JAL/predicted-branch target,
+        // straight-line advance) must compute from t0_pc_latched -- the
+        // PC that instruction actually came from -- not the live t0_pc,
+        // which has already moved on to requesting the next fetch. Only
+        // the final HOLD case is a decision about the fetch stage
+        // itself, so it correctly still reads the live register. See
+        // this file's header addendum.
         if (t0_redirect_needed)
             t0_next_pc = t0_branch_resolved_next_pc;
         else if (active_thread == 1'b0 && lane0_fire && d0_is_jal)
-            t0_next_pc = t0_pc + d0_imm;
+            t0_next_pc = t0_pc_latched + d0_imm;
         else if (active_thread == 1'b0 && lane0_fire && d0_is_branch && bht_predict_taken)
-            t0_next_pc = t0_pc + d0_imm;
+            t0_next_pc = t0_pc_latched + d0_imm;
         else if (active_thread == 1'b0 && lane0_fire)
-            t0_next_pc = lane1_fire ? (t0_pc + 64'd8) : (t0_pc + 64'd4);
+            t0_next_pc = lane1_fire ? (t0_pc_latched + 64'd8) : (t0_pc_latched + 64'd4);
         else
             t0_next_pc = t0_pc;
     end
 
     always @(*) begin
+        // Phase 11: mirrors t0's own block above.
         if (t1_redirect_needed)
             t1_next_pc = t1_branch_resolved_next_pc;
         else if (active_thread == 1'b1 && lane0_fire && d0_is_jal)
-            t1_next_pc = t1_pc + d0_imm;
+            t1_next_pc = t1_pc_latched + d0_imm;
         else if (active_thread == 1'b1 && lane0_fire && d0_is_branch && bht_predict_taken)
-            t1_next_pc = t1_pc + d0_imm;
+            t1_next_pc = t1_pc_latched + d0_imm;
         else if (active_thread == 1'b1 && lane0_fire)
-            t1_next_pc = lane1_fire ? (t1_pc + 64'd8) : (t1_pc + 64'd4);
+            t1_next_pc = lane1_fire ? (t1_pc_latched + 64'd8) : (t1_pc_latched + 64'd4);
         else
             t1_next_pc = t1_pc;
     end

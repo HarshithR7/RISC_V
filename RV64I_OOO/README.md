@@ -12,12 +12,14 @@ RV64IMACFD+RVV feature set.
 
 ## Status
 
-**Phases 1 through 10 are all complete: 33/33 single-core full-pipeline
+**Phases 1 through 11 are all complete: 33/33 single-core full-pipeline
 tests pass, plus a dedicated 2-core coherency test**, plus 21/21 isolated
 ROB+RAT unit-test checks, 15/15 standalone divider unit tests, 13/13
 isolated L1/L2 MESI coherency checks, 2/2 lockstep DMR checks, 6/6
 isolated ECC checks, and 3/3 isolated Phase 10 memory-optimization
-checks (prefetch, hit-under-miss, merging write buffer).
+checks (prefetch, hit-under-miss, merging write buffer) — all still
+passing, unchanged, after Phase 11's fetch-latency retiming for real
+FPGA timing (see below).
 
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
@@ -1411,3 +1413,93 @@ addressable gaps: this phase closes the highest-value ones.
   (a same-cycle OR term), turning those tests' exact-equality fault
   checks into false failures. Caught by actually running the full suite
   after the change, not assumed safe.
+
+## Phase 11: FPGA bring-up — registered fetch
+
+Prompted by the user asking to actually run the dual-core system on real
+hardware (a PYNQ-Z1, Zynq-7020). Before any Vivado/AXI work, one
+prerequisite turned out to be unavoidable and independent of *how* the
+core gets its program: at this design's actual memory footprint (four
+per-thread instruction memories plus the L2 backing memory), real Xilinx
+Block RAM is mandatory — distributed RAM, the one primitive with a
+same-cycle combinational read, would burn on the order of thousands of
+LUTs just for storage on a chip with ~13,300 total logic slices. Real
+Block RAM has no combinational-read mode, full stop, so a genuinely
+correct hardware port needs `instruction_fetch.v`'s fetch stage (and,
+much less invasively, `l2_cache.v`'s already-multi-cycle backing-memory
+miss path) converted from combinational to registered (1-cycle-latency)
+reads — a real timing change to the pipeline's fetch/decode boundary,
+not an AXI-wrapper detail, so it was done and verified in simulation
+first, on its own, before any board-specific work.
+
+- **`instruction_fetch_reg.v`** (new): a thin wrapper that instantiates
+  the sibling single-cycle core's `instruction_fetch.v` completely
+  unmodified (it's also used as-is by RV64I's own single-cycle datapath,
+  which genuinely needs the same-cycle read) and adds exactly one
+  register stage on the output. Functional fetch behavior — halfword
+  pairing, `$readmemh` content — is untouched; only *when* the result
+  becomes visible changes. Used in place of `instruction_fetch.v` at all
+  4 fetch instantiation sites in `riscv64_ooo_proc.v` (2 threads × 2-wide
+  fetch each).
+- **The one-cycle latency ripples into exactly two places** in
+  `riscv64_ooo_proc.v`, both handled with new per-thread registers
+  (`t0_pc_latched`/`t1_pc_latched`, `t0_fetch_valid`/`t1_fetch_valid`):
+  1. Every downstream consumer of "the PC of the instruction currently
+     being decoded" (`branch_rs.v`'s `alloc_pc`, `bht.v`'s `predict_pc`,
+     AUIPC's `src1_is_pc` operand, and this thread's own JAL/predicted-
+     branch target and straight-line-advance computation) now reads a
+     latched PC copy, paired 1:1 with `instruction_fetch_reg`'s own
+     internal register — both are clocked off the same live `t0_pc`/
+     `t1_pc` value each cycle, so they always arrive back in lockstep.
+     The live PC register itself is still used for the one case that's
+     actually about the fetch stage, not the decoded instruction: the
+     PC-hold case (dispatch didn't fire — not this thread's turn, or a
+     structural stall) correctly keeps re-requesting the same live
+     address.
+  2. Straight-line/JAL/predicted-branch redirects needed no new bubble
+     logic at all: they only ever change PC on this thread's own
+     dispatch turn, and Phase 7's SMT round-robin already guarantees a
+     full idle cycle (the other thread's turn) before this thread
+     dispatches again — which, worked out precisely, exactly absorbs one
+     cycle of fetch latency for free. Misprediction/JALR-resolution
+     redirects are NOT covered by that slack: they fire asynchronously,
+     from execution resolving, on whatever cycle that happens to land on
+     — without a real fetch-valid bit, the one fetch already in flight
+     from before such a redirect (a stale, wrong-path instruction) would
+     land in `t0_instruction0/1` exactly one cycle later and could be
+     dispatched as if real. `t0_fetch_valid`/`t1_fetch_valid` (registered
+     as `!t0_redirect_needed`/`!t1_redirect_needed` each cycle) gates
+     `lane0_fire` for exactly that one bubble cycle; `lane1_fire` already
+     depends on `lane0_fire`, so one gate covers both lanes.
+- **Both timing regimes were hand-verified against a precise cycle-by-
+  cycle model before writing any code** (present-address-cycle-K →
+  visible-at-cycle-K+1, for both the fetch's own register and the new PC
+  latch, in lockstep) — then confirmed by the existing regression suite,
+  which already exercises branches, loops, JAL/JALR, mispredictions, and
+  SMT extensively. All 33/33 single-core tests, the dual-core coherency
+  test, and both lockstep checks passed on the first full run after the
+  change, with cycle counts up by exactly the expected amount on branch-
+  and-loop-heavy tests (one bubble per misprediction/JALR redirect — real
+  hardware realism traded for a few extra cycles, not a bug).
+- **`pc_out0`/`pc_out1`** (the top-level ports `tb_lockstep.v` compares
+  cycle-by-cycle between two independent cores) now report the latched
+  PC — the PC of the instruction actually being decided this cycle —
+  rather than the live, already-advanced fetch-address register, for
+  semantic consistency. Lockstep comparison stays correct regardless
+  (both cores in a pair use the identical convention), and both lockstep
+  checks still pass.
+- **Zero regressions**: the full pre-existing suite — 33/33 single-core,
+  the dual-core coherency test, 13/13 isolated MESI checks, 21/21
+  isolated ROB+RAT checks, 6/6 isolated ECC checks, 3/3 Phase 10 checks,
+  both lockstep DMR checks, and all 6 benchmarks — passes, with cycle
+  counts shifted by exactly the expected redirect-bubble amount and
+  otherwise unchanged. The standalone module-level tests (MESI, ECC,
+  ROB+RAT, Phase 10) don't instantiate `riscv64_ooo_proc.v` at all and
+  were confirmed unaffected, as expected.
+- **Not done yet**: the actual Vivado/AXI/PYNQ integration layer (AXI-
+  lite control/status wrapper, true dual-port Block RAM + AXI BRAM
+  controller for PS-side program loading, block design, PYNQ Python
+  driver) — this phase was scoped to just the prerequisite timing fix,
+  verified in simulation only. No synthesis, timing closure, or
+  resource-utilization numbers exist yet for this design on real
+  hardware.
