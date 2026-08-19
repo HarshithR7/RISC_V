@@ -12,10 +12,11 @@ RV64IMACFD+RVV feature set.
 
 ## Status
 
-**Phases 1 through 8 are all complete: 33/33 single-core full-pipeline
+**Phases 1 through 9 are all complete: 33/33 single-core full-pipeline
 tests pass, plus a dedicated 2-core coherency test**, plus 21/21 isolated
-ROB+RAT unit-test checks, 15/15 standalone divider unit tests, and 13/13
-isolated L1/L2 MESI coherency checks.
+ROB+RAT unit-test checks, 15/15 standalone divider unit tests, 13/13
+isolated L1/L2 MESI coherency checks, 2/2 lockstep DMR checks, and 6/6
+isolated ECC checks.
 
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
@@ -45,6 +46,13 @@ isolated L1/L2 MESI coherency checks.
   L2, and genuine MESI coherency, wired all the way into the OoO
   pipeline's actual load/store execution — see "Phase 8: multi-level
   cache + MESI coherency" below.
+- **Phase 9**: redundancy, in two complementary parts. First, lockstep
+  dual-modular redundancy (DMR) — two fully independent cores run the
+  identical program and are continuously compared, with a sticky fault
+  flag on any divergence — see "Phase 9: lockstep redundancy (DMR)"
+  below. Second, real SECDED ECC (single-error-correct, double-error-
+  detect) on the register file, L1, L2, and ROB payload storage — see
+  "Phase 9 continued: ECC on memory structures" below.
 
 Tests cover RAW/WAR/WAW hazards (including intra-group ones specific to
 2-wide dispatch), a real backward-branch loop (which, as a side effect of
@@ -999,5 +1007,274 @@ something a fixed test program can force on every run with certainty.
   via a real cross-core coherency transaction, running through the full
   OoO pipeline, not a scripted protocol test.
 
+## Phase 9: lockstep redundancy (DMR)
+
+Cache/MESI (Phase 8) was about two cores *cooperating* through shared
+memory. Redundancy is the opposite goal: two copies of the *same* core
+running the *same* program from the *same* initial state, coupled to
+each other in no way at all, so that one copy's fault can never
+propagate into the other and corrupt the comparison itself. Scoped (via
+an explicit tradeoff conversation) as "lockstep first" -- dual-modular
+redundancy (DMR) with a continuous fault-detection comparator -- with
+ECC on memory structures queued as a follow-on, not built yet.
+
+- **`lockstep_dual_core.v`** (new): two independent
+  `riscv64_ooo_proc_solo` instances -- core A (primary, whose outputs
+  this module exposes) and core B (a pure checker) -- each with its own
+  private L1+L2+memory, deliberately *not* sharing an L2 the way
+  `dual_core_riscv64_ooo.v`'s cooperating cores do. A continuous
+  comparator watches both threads' PC and `ecall_halt` every cycle;
+  `lockstep_fault` is sticky (latches on first divergence, stays set
+  until reset), matching how a real safety system's fault flag needs to
+  persist for downstream handling rather than self-clear the instant a
+  transient mismatch passes.
+- **Fault-detection scope, deliberately narrower than "catch every
+  possible fault"**: comparing PC/halt only, not the full architectural
+  register file every cycle. Comparing everything would catch a fault
+  the instant it's *computed*, including a "dead" wrong value that never
+  again affects control flow -- but at the cost of a much wider per-cycle
+  comparator (every register, both write ports, both threads). PC/halt
+  comparison is far cheaper and still catches the overwhelming majority
+  of realistic faults, since almost any corrupted value eventually
+  reaches *some* branch condition or the final halt outcome -- the same
+  detection-latency-vs-comparator-cost tradeoff real lockstep systems
+  have to make too, not something unique to this scope.
+- **`tb_lockstep.v` / `build_lockstep_tests.py`** (new): a
+  `FAULT_INJECT_CYCLE` parameter drives a one-time, testbench-only
+  hierarchical corruption of one bit of core B's own architectural x7 at
+  a chosen cycle -- a simulated soft-error single-event upset in one of
+  the two redundant copies, not an RTL "please corrupt yourself" port (a
+  synthesizable version of that would be a strange thing for a real
+  redundant core to have). Two tests: `lockstep_baseline` (no fault
+  injected, `lockstep_fault` must stay 0 -- the "redundancy doesn't cry
+  wolf" check) and `lockstep_fault_detected` (`lockstep_fault` must latch
+  to 1).
+
+### Getting fault injection right took three iterations
+
+The end goal -- corrupt one bit in one redundant copy, prove the other
+copy's comparator catches it -- turned out to have more failure modes
+than expected, each only visible by actually running it and tracing
+cycle-by-cycle when it silently didn't work:
+
+1. **Forcing a `wire`, not a `reg`**: the first attempt used Verilog
+   `force`/`release` on `core_b`'s PC *output port* (a
+   continuously-driven wire). `lockstep_fault` never fired. `force` on a
+   wire only overrides what that wire displays; the moment `release`
+   executes, it snaps back to whatever its actual driver (the untouched
+   internal PC register) was already producing -- the "corruption" never
+   touched real state, so there was nothing left to observe by the next
+   clock edge.
+2. **`force`/`release` on an indexed array word isn't supported by
+   Icarus**: switching the target to `registers[5]` (an actual `reg`,
+   inside `register_file.v`'s architectural register array) seemed like
+   the fix, but `iverilog`'s code generator rejected it outright:
+   `cannot %force/vec4 to the word of a variable array`. More
+   fundamentally, `force` was the wrong tool for the job anyway -- a
+   soft-error bit-flip is a one-time event, not a sustained drive, and
+   `force`-then-`release` a mere `#1` later has the same
+   collapses-before-the-next-edge problem as case 1, just for a
+   different reason (NBA-scheduled real writes to the same array word
+   would still be racing a held force). Switched to a single plain
+   hierarchical procedural assignment instead -- a real one-time write,
+   which is both legal Icarus syntax and the semantically correct model
+   of a single-event upset.
+3. **Which register, and when**: the test program's `li x7, N` (its loop
+   bound) was initially left *inside* the loop body, redefined every
+   iteration -- so corrupting its committed copy did nothing, since
+   in-flight consumers were overwhelmingly reading it via CDB/tag
+   forwarding from the RS, not via a fresh read of the (corrupted)
+   architectural regfile, and any residual corruption got overwritten by
+   the very next iteration's own `li` anyway. Moving `li x7, N` outside
+   the loop (set once) fixed the forwarding-bypass problem, but exposed a
+   second one: the fixed injection cycle originally chosen landed
+   *before* `x7`'s own defining instruction had even committed, so its
+   real, correct write simply overwrote the injected corruption moments
+   later. Cycle-by-cycle tracing (`$display` of both cores' x7 every
+   cycle around the injection point) pinned down a cycle safely after
+   that commit, which finally produced a real, sustained divergence.
+
+The general lesson, now documented in `tb_lockstep.v`'s own header:
+target a register that (a) is a genuine `reg`, not a derived wire, (b) is
+written once and then stable -- not something every loop iteration
+redefines, since tight RAW chains route around the committed regfile via
+forwarding -- and (c) is corrupted *after* its own real defining write
+has already committed, not before.
+
+### Tests
+
+- **`build_lockstep_tests.py`**: 2/2 -- `lockstep_baseline` (no injected
+  fault, `lockstep_fault` stays 0 through a full correct run) and
+  `lockstep_fault_detected` (a mid-run bit-flip to core B's x7 at cycle
+  60, `lockstep_fault` latches to 1). Both run through the full OoO
+  pipeline (real dispatch/rename/execute/commit in each copy), not a
+  simplified comparator-only model.
+
+## Phase 9 continued: ECC on memory structures
+
+Lockstep DMR (above) catches *any* divergence between two whole redundant
+cores, at the cost of a second full core. ECC is the cheaper, narrower
+complement: real SECDED (single-error-correct, double-error-detect)
+protection on the individual storage arrays most exposed to a soft-error
+bit-flip, catching and silently fixing the common single-bit case without
+needing the other core's help at all. Scoped, per the user's original
+"both, lockstep first" direction, as the widest of the offered options:
+the architectural register file, the L1 data cache, the L2 data cache,
+and the ROB's payload storage.
+
+- **`ecc64.v`** (new): the one shared primitive everything else builds
+  on -- a classic Hamming SECDED(72,64) code (7 real Hamming parity bits
+  covering a 71-bit virtual codeword, plus 1 overall parity bit across
+  that codeword, giving 8 check bits total for 64 data bits). Always
+  computes both directions combinationally (`wr_data -> wr_check` and
+  `rd_data,rd_check -> rd_data_corrected,rd_sbe,rd_dbe`); a caller wires
+  up whichever half a given instantiation needs. The bit-position math
+  (which data bits fall under which parity group) is computed once, via
+  a `function` walking the 71-position codeword and skipping every
+  power-of-two (parity) position -- not a hand-written lookup table.
+- **`ecc_line.v`** (new): a thin generate-loop bundle of `ecc64.v`
+  instances, one per 64-bit word in a wider cache line (4 words for this
+  project's 32-byte lines) -- independently-corrected 64-bit words, not
+  one wider code across the whole line, since that would only ever
+  correct one bit *line-wide* instead of one bit *per word*.
+- **`ecc_register_file.v`** (new): drop-in replacement for the sibling
+  RV64I core's `register_file.v` (identical port list/semantics), used
+  only within `RV64I_OOO` -- the single-cycle core's own copy is never
+  touched, the same standing rule this project has followed for every
+  prior phase that reuses RV64I/src unchanged. All 4 architectural
+  register-file instances in `riscv64_ooo_proc.v` (2 per thread, the
+  existing "extra read port via a second full instance" pattern) were
+  switched over.
+- **`l1_cache.v`**: `line[]` (the cache data array) gained a parallel
+  `line_check[]`; every access point (CPU read-hit, CPU write-hit merge,
+  the store-buffer-drain UPGR merge, and the coherence snoop response)
+  now decodes-and-corrects through its own `ecc_line.v` instance before
+  the corrected value is used, and re-encodes fresh check bits on every
+  write. `tag[]`/`state[]` are deliberately *not* protected -- see the
+  scope note below.
+- **`l2_cache.v`**: same idea for `l2_data[]`, simpler in one respect
+  (only ever one transaction in flight, so only one `req_idx`-keyed
+  `ecc_line.v` instance is needed) since L2 never merges a partial write
+  the way L1's CPU-facing side does -- every L2 write (a requester's own
+  dirty writeback, a memory fetch, or an absorbed dirty snoop-forward)
+  replaces the whole line outright.
+- **`rob.v`**: `value_arr[]` (the scalar payload that becomes committed
+  architectural register state) gained a parallel `value_check[]`.
+  Correction is applied on *every* read port, including the 4 dispatch-
+  time operand lookups (a consumer capturing a bad value straight out of
+  the ROB would be a real, if quieter, failure mode than a corrupted
+  commit) -- but fault *counting* toward `ecc_rob_sbe_fault`/
+  `dbe_fault` is scoped to just the commit-time (`head`/`head2`) reads,
+  gated on `head_ready`/`head2_ready`, since those are the only reads
+  with an equally clean "is this meaningful right now" signal to gate
+  on (see the module's own comment for why the lookup ports don't have
+  one). `vec_value_arr[]` is out of scope, matching vector's
+  already-narrower, thread-0-only footprint everywhere else in this
+  project.
+
+### Scope: data arrays, not control metadata
+
+Every structure above protects only its bulk *data* payload -- L1/L2's
+line contents, the register file's/ROB's stored values -- not the small
+per-entry control fields alongside them (`tag[]`/`state[]` in the
+caches, `valid_arr`/`done_arr`/`rd_arr`/etc. in the ROB). A corrupted
+control bit is a different failure mode (misdirecting a hit/miss
+decision or a commit's own bookkeeping, rather than silently handing
+back wrong data) and was deliberately left out of this pass, the same
+kind of explicit scope line this project has drawn before (e.g. Phase 9
+lockstep comparing only PC/halt, not full architectural state, every
+cycle).
+
+### Two real timing bugs found integrating the fault-flag outputs
+
+Both structures' *data correction* worked on the first pass (verified by
+`tb_ecc_line.v` and friends in isolation); it was specifically the
+`sbe_fault`/`dbe_fault` *output* signals -- observability, not
+correctness of the corrected data itself -- that needed a second pass
+once wired into `l1_cache.v` and `l2_cache.v`'s real multi-cycle
+request/response protocols:
+
+- **`l1_cache.v`**: gating the fault flags on the live request signal
+  (`cpu_read_req && rd_hit && ...`) meant the flag was only true during
+  the exact cycle the *request* was asserted -- but `cpu_read_req` is
+  already back to 0 well before the *response* (`cpu_read_valid`)
+  actually pulses several cycles later, which is the natural point any
+  real caller (including `tb_ecc_l1.v` itself, on its first attempt)
+  would check it. Found immediately by the test reporting `sbe=0` on a
+  real, injected corruption. Fixed by latching `access_sbe`/`access_dbe`
+  into registers at the same cycle the FSM actually decides to consume a
+  corrected value, so they're already stable by the next cycle's DONE
+  state.
+- **`l2_cache.v`**: a subtler version of the same class of bug --
+  `c0_resp_valid`/`c1_resp_valid` are themselves `<=`-assigned *inside*
+  the `ST_RESPOND` state's own body, so they only become visible the
+  cycle *after* `fsm` actually holds `ST_RESPOND` (once it's already
+  moved on to `ST_COOLDOWN`). A combinational `fsm == ST_RESPOND` gate is
+  therefore one cycle early relative to when `resp_valid` is actually
+  observed. Same fix: latch `access_sbe`/`access_dbe` in the same
+  `ST_RESPOND` body, alongside `c0_resp_valid`/`c1_resp_valid`
+  themselves, so both become visible on the same next cycle.
+
+The ROB's read ports needed no such fix: `head_value`/`lookup*_value`
+are plain continuous combinational reads (like `ecc_register_file.v`'s
+own read ports), not a pulsed request/response protocol, so gating
+directly on `head_ready`/`head2_ready` was correct the first time.
+
+### A real interaction with Phase 9's other half (lockstep)
+
+Once the register file was ECC-protected, `tb_lockstep.v`'s existing
+`lockstep_fault_detected` test (a single-bit flip of core B's x7)
+started failing -- `lockstep_fault` stopped firing. Not a regression:
+`ecc_register_file.v` now transparently corrects exactly that kind of
+single-bit corruption before it can ever reach a branch and diverge
+control flow, which is the *correct*, intended layering of the two
+mechanisms -- ECC silently heals the common single-bit case; lockstep is
+the backstop for whatever ECC structurally cannot fix. Fixed by changing
+the injected fault to flip *two* bits instead of one: an uncorrectable
+(dbe) error that `ecc_register_file.v` passes through unmodified (with a
+fault flag raised, but no attempted correction), so it still reaches the
+pipeline wrong and still diverges control flow the way the original
+single-bit test intended. Documented inline in both `tb_lockstep.v` and
+`build_lockstep_tests.py`.
+
+### Tests
+
+- **`tb_ecc64.v`**: 5 representative 64-bit data patterns x (1 clean +
+  all 72 single-bit-flip positions + 20 sampled double-bit-flip
+  combinations) -- exhaustive per-position coverage of the core SECDED
+  primitive, not spot checks, since off-by-one bit-position math is
+  exactly where "looks right" and "is right" diverge.
+- **`tb_ecc_line.v`**: clean round-trip, one single-bit flip in each of
+  the 4 words of a 256-bit line in turn (proving *per-word* correction),
+  and a double-bit flip confined to one word (proving the aggregate
+  `rd_dbe` is correctly driven by that one word, not a bundling bug that
+  always reports it).
+- **`tb_ecc_register_file.v`**: clean write/read through both ports, x0
+  always reads zero and never faults, single-bit corruption of a
+  register's data *and*, separately, its check bits (both must resolve
+  identically), and a double-bit corruption reporting `dbe_fault`.
+- **`tb_ecc_l1.v`** / **`tb_ecc_l2.v`**: a real write-miss/BusRd-miss
+  fills a line through the genuine MESI/memory-fetch FSM path (not a
+  hand-poked initial value), then a hierarchical procedural corruption
+  (same one-time-write technique as `tb_lockstep.v`, and for the same
+  reason -- Icarus can't `force` an indexed word of a variable array
+  either) proves transparent correction plus `sbe_fault`, and a second,
+  double-bit corruption proves `dbe_fault` with the data left
+  uncorrected.
+- **`tb_ecc_rob.v`**: a real `mark_valid` broadcast produces real check
+  bits (not hand-poked ones), then the same single-bit/double-bit
+  corruption pattern against `value_arr[0]`, plus confirming
+  `head_ready` (and therefore the fault flags) correctly goes quiet once
+  the entry actually commits.
+- **Zero regressions**: the full pre-existing suite -- 33/33 single-core,
+  the dual-core coherency test, 13/13 isolated MESI checks, 21/21
+  isolated ROB+RAT checks, both lockstep DMR checks, and all 6
+  benchmarks (identical cycle counts to before this phase) -- passes
+  unchanged with every one of these structures now ECC-wrapped, since
+  none of this phase's work is externally observable behavior change
+  absent an actual injected fault.
+
 33/33 single-core, plus the dual-core coherency test, plus 13/13
-isolated MESI checks.
+isolated MESI checks, plus 21/21 isolated ROB+RAT checks, plus 2/2
+lockstep DMR checks, plus 6/6 isolated ECC checks (`ecc64`, `ecc_line`,
+register file, L1, L2, ROB).

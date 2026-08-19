@@ -211,7 +211,19 @@ module rob #(
     output head2_is_vec_dest,
     output head2_is_store,
     output head2_is_ecall,
-    input commit_req2
+    input commit_req2,
+
+    // Phase 9 (ECC): protects only value_arr[] (the scalar payload that
+    // ultimately becomes committed architectural register state), not
+    // vec_value_arr[] -- consistent with vector's already-narrower,
+    // thread-0-only scope everywhere else in this project -- and not the
+    // small per-entry control fields (valid/done/has_dest/rd/etc.), same
+    // "bulk data, not small control metadata" scope as l1_cache.v/
+    // l2_cache.v/ecc_register_file.v. See the ECC section below for why
+    // fault *correction* applies to every read port but fault *counting*
+    // is scoped to the commit-time (head/head2) reads only.
+    output ecc_rob_sbe_fault,
+    output ecc_rob_dbe_fault
 );
     localparam TB = $clog2(DEPTH);
 
@@ -223,6 +235,7 @@ module rob #(
     reg has_dest_arr  [0:DEPTH-1];
     reg [4:0] rd_arr   [0:DEPTH-1];
     reg [63:0] value_arr[0:DEPTH-1];
+    reg [7:0] value_check[0:DEPTH-1];  // Phase 9 (ECC): SECDED check bits for value_arr
     reg [VLEN-1:0] vec_value_arr[0:DEPTH-1];
     reg is_vec_dest_arr[0:DEPTH-1];
     reg is_store_arr [0:DEPTH-1];
@@ -238,7 +251,6 @@ module rob #(
     assign head_tag        = head_ptr;
     assign head_has_dest   = has_dest_arr[head_ptr];
     assign head_rd         = rd_arr[head_ptr];
-    assign head_value      = value_arr[head_ptr];
     assign head_vec_value  = vec_value_arr[head_ptr];
     assign head_is_vec_dest = is_vec_dest_arr[head_ptr];
     assign head_is_store   = is_store_arr[head_ptr];
@@ -249,20 +261,73 @@ module rob #(
     assign head2_tag        = head2_ptr;
     assign head2_has_dest   = has_dest_arr[head2_ptr];
     assign head2_rd         = rd_arr[head2_ptr];
-    assign head2_value      = value_arr[head2_ptr];
     assign head2_vec_value  = vec_value_arr[head2_ptr];
     assign head2_is_vec_dest = is_vec_dest_arr[head2_ptr];
     assign head2_is_store   = is_store_arr[head2_ptr];
     assign head2_is_ecall   = is_ecall_arr[head2_ptr];
 
     assign lookup1_done  = done_arr[lookup1_tag];
-    assign lookup1_value = value_arr[lookup1_tag];
     assign lookup2_done  = done_arr[lookup2_tag];
-    assign lookup2_value = value_arr[lookup2_tag];
     assign lookup3_done  = done_arr[lookup3_tag];
-    assign lookup3_value = value_arr[lookup3_tag];
     assign lookup4_done  = done_arr[lookup4_tag];
-    assign lookup4_value = value_arr[lookup4_tag];
+
+    // ---- Phase 9 (ECC): one decode instance per read port. Correction
+    // is applied on every one of them (lookup1-4 included -- a
+    // dispatching consumer capturing a bad operand value straight out of
+    // the ROB would be a real, if quieter, failure mode than a corrupted
+    // commit), but *counting* a fault into ecc_rob_sbe_fault/dbe_fault
+    // below is deliberately scoped to just the commit-time (head/head2)
+    // reads: head_ready/head2_ready already cleanly answer "is this read
+    // meaningful right now", whereas a lookup port's tag input is simply
+    // always driven to *something* by the caller's dispatch-stage wires,
+    // valid or not, even on a cycle nothing is really consulting that
+    // port -- there's no equally clean "is the caller actually using this
+    // lookup right now" signal on this module's own ports to gate on
+    // (unlike ecc_register_file.v's read_reg1/2 != x0, or l1_cache.v's
+    // request-valid lines), so counting lookup-port faults would risk
+    // reporting noise from an untouched, don't-care-value tag as if it
+    // were a real fault.
+    wire [63:0] lookup1_corrected, lookup2_corrected, lookup3_corrected, lookup4_corrected;
+    wire lookup1_sbe, lookup1_dbe, lookup2_sbe, lookup2_dbe;
+    wire lookup3_sbe, lookup3_dbe, lookup4_sbe, lookup4_dbe;
+    assign lookup1_value = lookup1_corrected;
+    assign lookup2_value = lookup2_corrected;
+    assign lookup3_value = lookup3_corrected;
+    assign lookup4_value = lookup4_corrected;
+    ecc64 ecc_lookup1_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[lookup1_tag]), .rd_check(value_check[lookup1_tag]),
+        .rd_data_corrected(lookup1_corrected), .rd_sbe(lookup1_sbe), .rd_dbe(lookup1_dbe));
+    ecc64 ecc_lookup2_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[lookup2_tag]), .rd_check(value_check[lookup2_tag]),
+        .rd_data_corrected(lookup2_corrected), .rd_sbe(lookup2_sbe), .rd_dbe(lookup2_dbe));
+    ecc64 ecc_lookup3_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[lookup3_tag]), .rd_check(value_check[lookup3_tag]),
+        .rd_data_corrected(lookup3_corrected), .rd_sbe(lookup3_sbe), .rd_dbe(lookup3_dbe));
+    ecc64 ecc_lookup4_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[lookup4_tag]), .rd_check(value_check[lookup4_tag]),
+        .rd_data_corrected(lookup4_corrected), .rd_sbe(lookup4_sbe), .rd_dbe(lookup4_dbe));
+
+    wire [63:0] head_corrected, head2_corrected;
+    wire head_val_sbe, head_val_dbe, head2_val_sbe, head2_val_dbe;
+    assign head_value  = head_corrected;
+    assign head2_value = head2_corrected;
+    ecc64 ecc_head_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[head_ptr]), .rd_check(value_check[head_ptr]),
+        .rd_data_corrected(head_corrected), .rd_sbe(head_val_sbe), .rd_dbe(head_val_dbe));
+    ecc64 ecc_head2_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[head2_ptr]), .rd_check(value_check[head2_ptr]),
+        .rd_data_corrected(head2_corrected), .rd_sbe(head2_val_sbe), .rd_dbe(head2_val_dbe));
+
+    assign ecc_rob_sbe_fault = (head_ready && head_val_sbe) || (head2_ready && head2_val_sbe);
+    assign ecc_rob_dbe_fault = (head_ready && head_val_dbe) || (head2_ready && head2_val_dbe);
+
+    // ---- Phase 9 (ECC): encode instances for the two scalar CDB mark
+    // ports (mark_valid/mark_b_valid) -- the only writers of value_arr.
+    wire [7:0] mark_check, mark_b_check;
+    ecc64 ecc_mark_i   (.wr_data(mark_value),   .wr_check(mark_check),
+        .rd_data(64'b0), .rd_check(8'b0), .rd_data_corrected(), .rd_sbe(), .rd_dbe());
+    ecc64 ecc_mark_b_i (.wr_data(mark_b_value), .wr_check(mark_b_check),
+        .rd_data(64'b0), .rd_check(8'b0), .rd_data_corrected(), .rd_sbe(), .rd_dbe());
 
     assign vec_lookup1_done  = done_arr[vec_lookup1_tag];
     assign vec_lookup1_value = vec_value_arr[vec_lookup1_tag];
@@ -290,6 +355,7 @@ module rob #(
             for (i = 0; i < DEPTH; i = i + 1) begin
                 valid_arr[i] <= 1'b0;
                 done_arr[i]  <= 1'b0;
+                value_check[i] <= 8'b0;
             end
         end else begin
             // Allocate (up to 2, lane 0 then lane 1) and commit (up to 1)
@@ -358,10 +424,12 @@ module rob #(
             if (mark_valid) begin
                 done_arr[mark_tag]  <= 1'b1;
                 value_arr[mark_tag] <= mark_value;
+                value_check[mark_tag] <= mark_check;
             end
             if (mark_b_valid) begin
                 done_arr[mark_b_tag]  <= 1'b1;
                 value_arr[mark_b_tag] <= mark_b_value;
+                value_check[mark_b_tag] <= mark_b_check;
             end
             if (vec_mark_valid) begin
                 done_arr[vec_mark_tag]      <= 1'b1;

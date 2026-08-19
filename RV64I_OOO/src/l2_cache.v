@@ -89,7 +89,13 @@ module l2_cache #(
     output wire [ADDR_BITS-1:0] snoop1_req_addr,
     input snoop1_resp_hit,
     input snoop1_resp_dirty,
-    input [LINE_BYTES*8-1:0] snoop1_resp_data
+    input [LINE_BYTES*8-1:0] snoop1_resp_data,
+
+    // Phase 9 (ECC): protects only l2_data[] (see the ECC section below),
+    // not the directory (l2_valid/l2_tag/presence0/presence1) -- same
+    // "bulk data, not small control metadata" scope as l1_cache.v.
+    output ecc_l2_sbe_fault,
+    output ecc_l2_dbe_fault
 );
     localparam OFF_BITS = $clog2(LINE_BYTES);
     localparam IDX_BITS = $clog2(L2_LINES);
@@ -101,6 +107,10 @@ module l2_cache #(
     reg l2_valid [0:L2_LINES-1];
     reg [TAG_BITS-1:0] l2_tag [0:L2_LINES-1];
     reg [VLEN-1:0] l2_data [0:L2_LINES-1];
+    // Phase 9 (ECC): check bits for l2_data[]. LINE_BYTES wide -- see
+    // ecc_line.v's header for why that's exactly right (8 check bits per
+    // 64-bit word, LINE_BYTES/8 words per line).
+    reg [LINE_BYTES-1:0] l2_check [0:L2_LINES-1];
     reg presence0 [0:L2_LINES-1];
     reg presence1 [0:L2_LINES-1];
 
@@ -108,6 +118,7 @@ module l2_cache #(
     initial begin
         for (li = 0; li < L2_LINES; li = li + 1) begin
             l2_valid[li] = 1'b0;
+            l2_check[li] = {LINE_BYTES{1'b0}};
             presence0[li] = 1'b0;
             presence1[li] = 1'b0;
         end
@@ -179,13 +190,56 @@ module l2_cache #(
                                                           : (snoop1_resp_hit && snoop1_resp_dirty));
     wire [LINE_BYTES*8-1:0] normal_other_data = req_core ? snoop0_resp_data : snoop1_resp_data;
 
+    // ---- Phase 9 (ECC): one shared decode/encode instance, keyed on
+    // req_idx -- unlike l1_cache.v, only one L2 transaction is ever in
+    // flight at a time (a single FSM, no independent concurrent access
+    // points), so req_idx is the only index that ever matters and stays
+    // stable (derived from the latched req_addr_r, not a live request
+    // line) for the whole transaction. Still needs the same registered-
+    // latching treatment l1_cache.v's fault flags needed, and for the
+    // same underlying reason: c0_resp_valid/c1_resp_valid are themselves
+    // `<=`-assigned *inside* the ST_RESPOND state's own body, so they
+    // only become visible the cycle *after* fsm actually holds
+    // ST_RESPOND (once it's already moved on to ST_COOLDOWN) -- a
+    // combinational `fsm == ST_RESPOND` gate would therefore be one cycle
+    // early relative to when a caller watching resp_valid actually
+    // samples it (found via tb_ecc_l2.v initially reporting sbe=0 on a
+    // real corruption, the same way tb_ecc_l1.v caught L1's version of
+    // this). Fixed by latching access_sbe/access_dbe in that same
+    // ST_RESPOND body, alongside c0_resp_valid/c1_resp_valid themselves.
+    //
+    // None of L2's 3 write sites (a requester's own dirty writeback, a
+    // memory fetch, or an absorbed dirty snoop-forward) are a
+    // read-modify-write of L2's own existing data -- L2 always replaces
+    // the whole line, never merges a partial store the way l1_cache.v's
+    // CPU-facing side does -- so, unlike l1_cache.v's wr_write_value,
+    // l2_write_value never depends on l2_line_corrected; it's a plain
+    // FSM-state mux over the 3 fresh incoming values.
+    wire [LINE_BYTES*8-1:0] l2_write_value =
+        (fsm == ST_MEM_WAIT)    ? mem_vrdata :
+        (fsm == ST_SNOOP_OTHER) ? normal_other_data :
+                                   req_wbdata_r; // ST_EVICT_SNOOP (REQ_WB)
+    wire [LINE_BYTES-1:0] l2_write_check;
+    wire [LINE_BYTES*8-1:0] l2_line_corrected;
+    wire l2_line_sbe, l2_line_dbe;
+    ecc_line #(.LINE_BYTES(LINE_BYTES)) ecc_l2_i (
+        .wr_line(l2_write_value), .wr_check(l2_write_check),
+        .rd_line(l2_data[req_idx]), .rd_check(l2_check[req_idx]),
+        .rd_line_corrected(l2_line_corrected), .rd_sbe(l2_line_sbe), .rd_dbe(l2_line_dbe)
+    );
+    reg access_sbe, access_dbe;
+    assign ecc_l2_sbe_fault = access_sbe;
+    assign ecc_l2_dbe_fault = access_dbe;
+
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             fsm <= ST_IDLE;
             mem_vread <= 1'b0; mem_vwrite <= 1'b0;
             c0_resp_valid <= 1'b0; c1_resp_valid <= 1'b0;
+            access_sbe <= 1'b0; access_dbe <= 1'b0;
             for (li = 0; li < L2_LINES; li = li + 1) begin
                 l2_valid[li] <= 1'b0;
+                l2_check[li] <= {LINE_BYTES{1'b0}};
                 presence0[li] <= 1'b0;
                 presence1[li] <= 1'b0;
             end
@@ -225,7 +279,8 @@ module l2_cache #(
                     if (req_type_r == REQ_WB) begin
                         l2_valid[req_idx] <= 1'b1;
                         l2_tag[req_idx]   <= req_tag;
-                        l2_data[req_idx]  <= req_wbdata_r;
+                        l2_data[req_idx]  <= l2_write_value;
+                        l2_check[req_idx] <= l2_write_check;
                         mem_vwrite <= 1'b1; mem_vaddr <= line_addr_of(req_tag, req_idx); mem_vwdata <= req_wbdata_r;
                         if (req_core) presence1[req_idx] <= 1'b1; else presence0[req_idx] <= 1'b1;
                         fsm <= ST_RESPOND;
@@ -275,7 +330,8 @@ module l2_cache #(
                     // used throughout this pair of modules.
                     l2_valid[req_idx] <= 1'b1;
                     l2_tag[req_idx]   <= req_tag;
-                    l2_data[req_idx]  <= mem_vrdata;
+                    l2_data[req_idx]  <= l2_write_value;
+                    l2_check[req_idx] <= l2_write_check;
                     fsm <= ST_SNOOP_OTHER;
                 end
 
@@ -299,7 +355,8 @@ module l2_cache #(
                         // request carries the real byte address (possibly
                         // with a non-zero in-line offset), and the vector
                         // memory port needs the line's base address.
-                        l2_data[req_idx] <= normal_other_data;
+                        l2_data[req_idx] <= l2_write_value;
+                        l2_check[req_idx] <= l2_write_check;
                         mem_vwrite <= 1'b1;
                         mem_vaddr  <= line_addr_of(req_tag, req_idx);
                         mem_vwdata <= normal_other_data;
@@ -315,13 +372,15 @@ module l2_cache #(
                 ST_RESPOND: begin
                     if (req_core) begin
                         c1_resp_valid <= 1'b1;
-                        c1_resp_data <= l2_data[req_idx];
+                        c1_resp_data <= l2_line_corrected;
                         c1_resp_exclusive <= !presence0[req_idx];
                     end else begin
                         c0_resp_valid <= 1'b1;
-                        c0_resp_data <= l2_data[req_idx];
+                        c0_resp_data <= l2_line_corrected;
                         c0_resp_exclusive <= !presence1[req_idx];
                     end
+                    access_sbe <= l2_line_sbe;
+                    access_dbe <= l2_line_dbe;
                     fsm <= ST_COOLDOWN;
                 end
 

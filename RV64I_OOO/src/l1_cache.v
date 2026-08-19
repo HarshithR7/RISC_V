@@ -74,7 +74,14 @@ module l1_cache #(
     input [ADDR_BITS-1:0] snoop_req_addr,
     output snoop_resp_hit,
     output snoop_resp_dirty,
-    output [LINE_BYTES*8-1:0] snoop_resp_data
+    output [LINE_BYTES*8-1:0] snoop_resp_data,
+
+    // Phase 9 (ECC): fires when an actually-consumed line access (CPU
+    // read/write hit, a store-buffer-drain UPGR merge, or a snoop
+    // forward) hit a corrupted `line[]` word -- see the ECC section
+    // below for why `tag[]`/`state[]` aren't included in this scope.
+    output ecc_l1_sbe_fault,
+    output ecc_l1_dbe_fault
 );
     localparam OFF_BITS = $clog2(LINE_BYTES);
     localparam IDX_BITS = $clog2(LINES);
@@ -87,11 +94,20 @@ module l1_cache #(
     reg [1:0] state [0:LINES-1];
     reg [TAG_BITS-1:0] tag [0:LINES-1];
     reg [LINE_BYTES*8-1:0] line [0:LINES-1];
+    // Phase 9 (ECC): only the bulk `line[]` data array is ECC-protected,
+    // not `tag[]`/`state[]` -- the same "protect the data, not small
+    // control metadata" scoping already used for the register file (see
+    // ecc_register_file.v). A corrupted tag/state bit would misdirect a
+    // hit/miss decision rather than silently hand back wrong data, a
+    // different (and out of scope here) failure mode.
+    reg [LINE_BYTES-1:0] line_check [0:LINES-1];
 
     integer li;
     initial begin
-        for (li = 0; li < LINES; li = li + 1)
+        for (li = 0; li < LINES; li = li + 1) begin
             state[li] = I;
+            line_check[li] = {LINE_BYTES{1'b0}};
+        end
     end
 
     // ---- Same func3 sub-word extract/merge semantics as data_memory.v -
@@ -147,7 +163,6 @@ module l1_cache #(
     wire [TAG_BITS-1:0] snoop_tag = snoop_req_addr[ADDR_BITS-1:IDX_BITS+OFF_BITS];
     assign snoop_resp_hit   = snoop_req_valid && (state[snoop_idx] != I) && (tag[snoop_idx] == snoop_tag);
     assign snoop_resp_dirty = snoop_resp_hit && (state[snoop_idx] == M);
-    assign snoop_resp_data  = line[snoop_idx];
 
     // ---- CPU-facing FSM --------------------------------------------------
     localparam ST_IDLE = 0, ST_EVICT_WB = 1, ST_REQ = 2, ST_WAIT = 3, ST_DONE_R = 4, ST_DONE_W = 5;
@@ -176,12 +191,102 @@ module l1_cache #(
                           (state[wr_idx] == M || state[wr_idx] == E);
     wire wr_hit_s      = (state[wr_idx] != I) && (tag[wr_idx] == wr_tag) && (state[wr_idx] == S);
 
+    // ---- Phase 9 (ECC): one decode/encode instance per named access
+    // point (rd_idx, wr_idx, op_idx, snoop_idx). rd_idx and wr_idx get
+    // separate instances even though a real request is only ever one or
+    // the other at a time (this project's lsq.v protocol) -- both wires
+    // are combinationally live every cycle regardless, so there's no
+    // "which one is real" ambiguity to resolve here; it's resolved below
+    // instead, when deciding which access actually counts as a fault.
+    //
+    // Each instance's wr_line is fed from that SAME instance's own
+    // rd_line_corrected (via merge_write) for a read-modify-write --
+    // this is not a combinational loop: encode (wr_line -> wr_check) and
+    // decode (rd_line/rd_check -> rd_line_corrected) are independent
+    // paths through ecc_line.v/ecc64.v, so rd_line_corrected depends only
+    // on the stored rd_line/rd_check, never on wr_line.
+    wire [LINE_BYTES*8-1:0] rd_line_corrected;
+    wire rd_line_sbe, rd_line_dbe;
+    ecc_line #(.LINE_BYTES(LINE_BYTES)) ecc_rd_i (
+        .wr_line({LINE_BYTES*8{1'b0}}), .wr_check(),
+        .rd_line(line[rd_idx]), .rd_check(line_check[rd_idx]),
+        .rd_line_corrected(rd_line_corrected), .rd_sbe(rd_line_sbe), .rd_dbe(rd_line_dbe)
+    );
+
+    wire [LINE_BYTES*8-1:0] wr_line_corrected;
+    wire wr_line_sbe, wr_line_dbe;
+    wire [LINE_BYTES*8-1:0] wr_write_value = merge_write(wr_line_corrected, cpu_write_addr, cpu_write_data, cpu_write_func3);
+    wire [LINE_BYTES-1:0] wr_write_check;
+    ecc_line #(.LINE_BYTES(LINE_BYTES)) ecc_wr_i (
+        .wr_line(wr_write_value), .wr_check(wr_write_check),
+        .rd_line(line[wr_idx]), .rd_check(line_check[wr_idx]),
+        .rd_line_corrected(wr_line_corrected), .rd_sbe(wr_line_sbe), .rd_dbe(wr_line_dbe)
+    );
+
+    // op_write_value covers all 3 ST_WAIT write cases below (UPGR-merge,
+    // fill-then-merge, plain fill) -- collapsing what were 3 separate
+    // `merge_write(...)` call sites in the FSM into one shared mux, which
+    // also means the FSM only ever needs to write `line[op_idx]` /
+    // `line_check[op_idx]` from a single already-computed pair.
+    wire [LINE_BYTES*8-1:0] op_line_corrected;
+    wire op_line_sbe, op_line_dbe;
+    wire [LINE_BYTES*8-1:0] op_write_value =
+        (l2_req_type == REQ_UPGR) ? merge_write(op_line_corrected, op_addr, op_wdata, op_func3) :
+        is_write_op                ? merge_write(l2_resp_data, op_addr, op_wdata, op_func3) :
+                                      l2_resp_data;
+    wire [LINE_BYTES-1:0] op_write_check;
+    ecc_line #(.LINE_BYTES(LINE_BYTES)) ecc_op_i (
+        .wr_line(op_write_value), .wr_check(op_write_check),
+        .rd_line(line[op_idx]), .rd_check(line_check[op_idx]),
+        .rd_line_corrected(op_line_corrected), .rd_sbe(op_line_sbe), .rd_dbe(op_line_dbe)
+    );
+
+    wire [LINE_BYTES*8-1:0] snoop_line_corrected;
+    wire snoop_line_sbe, snoop_line_dbe;
+    ecc_line #(.LINE_BYTES(LINE_BYTES)) ecc_snoop_i (
+        .wr_line({LINE_BYTES*8{1'b0}}), .wr_check(),
+        .rd_line(line[snoop_idx]), .rd_check(line_check[snoop_idx]),
+        .rd_line_corrected(snoop_line_corrected), .rd_sbe(snoop_line_sbe), .rd_dbe(snoop_line_dbe)
+    );
+    assign snoop_resp_data = snoop_line_corrected;
+
+    // A fault only counts when the corrected value is actually consumed
+    // -- an access point's decode runs unconditionally every cycle
+    // regardless of whether anything real is happening at that index
+    // right now, so gating on the real consuming condition (same
+    // reasoning as ecc_register_file.v gating on read_reg1/2 != x0)
+    // avoids reporting noise from an otherwise-irrelevant slot.
+    //
+    // The snoop path is combinational (a snoop response has no
+    // request/response pipeline delay to begin with -- see this module's
+    // header), so its fault bit is combinational too. The CPU-facing hit
+    // paths, though, are the *decision* cycle of a multi-cycle
+    // transaction: a caller watching for `cpu_read_valid`/
+    // `cpu_write_done` (the natural, already-synchronized point to check
+    // "did what I just got back have a fault") would need to catch a
+    // same-cycle-as-the-request combinational pulse that's long gone by
+    // the time the transaction actually completes -- found exactly this
+    // gap via tb_ecc_l1.v initially reporting sbe=0 on a real corruption,
+    // because the checking testbench (like any real caller) naturally
+    // polls busy/valid, not the original request pulse. Fixed by latching
+    // into access_sbe/access_dbe at the same cycle the FSM decides to
+    // consume a corrected value, so the flag is already stable by the
+    // time the corresponding DONE state (and cpu_read_valid/
+    // cpu_write_done) is reached one cycle later.
+    reg access_sbe, access_dbe;
+    assign ecc_l1_sbe_fault = access_sbe || (snoop_req_valid && snoop_resp_hit && snoop_line_sbe);
+    assign ecc_l1_dbe_fault = access_dbe || (snoop_req_valid && snoop_resp_hit && snoop_line_dbe);
+
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             fsm <= ST_IDLE;
             l2_req_valid <= 1'b0;
-            for (li = 0; li < LINES; li = li + 1)
+            access_sbe <= 1'b0;
+            access_dbe <= 1'b0;
+            for (li = 0; li < LINES; li = li + 1) begin
                 state[li] <= I;
+                line_check[li] <= {LINE_BYTES{1'b0}};
+            end
         end else begin
             // Snoop-driven state update -- applies every cycle regardless
             // of this L1's own FSM state (see module header for why this
@@ -196,7 +301,8 @@ module l1_cache #(
             case (fsm)
                 ST_IDLE: begin
                     if (cpu_read_req && rd_hit) begin
-                        read_data_r <= extract_read(line[rd_idx], cpu_read_addr, cpu_read_func3);
+                        read_data_r <= extract_read(rd_line_corrected, cpu_read_addr, cpu_read_func3);
+                        access_sbe <= rd_line_sbe; access_dbe <= rd_line_dbe;
                         fsm <= ST_DONE_R;
                     end else if (cpu_read_req && !rd_hit) begin
                         is_write_op <= 1'b0;
@@ -205,7 +311,7 @@ module l1_cache #(
                         if (state[rd_idx] == M) begin
                             l2_req_valid <= 1'b1; l2_req_type <= REQ_WB;
                             l2_req_addr <= {tag[rd_idx], rd_idx, {OFF_BITS{1'b0}}};
-                            l2_req_wb_data <= line[rd_idx];
+                            l2_req_wb_data <= rd_line_corrected;
                             state[rd_idx] <= I;
                             fsm <= ST_EVICT_WB;
                         end else begin
@@ -215,8 +321,10 @@ module l1_cache #(
                             fsm <= ST_WAIT;
                         end
                     end else if (cpu_write_req && wr_hit_m_or_e) begin
-                        line[wr_idx] <= merge_write(line[wr_idx], cpu_write_addr, cpu_write_data, cpu_write_func3);
+                        line[wr_idx] <= wr_write_value;
+                        line_check[wr_idx] <= wr_write_check;
                         state[wr_idx] <= M;
+                        access_sbe <= wr_line_sbe; access_dbe <= wr_line_dbe;
                         fsm <= ST_DONE_W;
                     end else if (cpu_write_req && wr_hit_s) begin
                         // Already shared and clean: just need to invalidate
@@ -235,7 +343,7 @@ module l1_cache #(
                         if (state[wr_idx] == M) begin
                             l2_req_valid <= 1'b1; l2_req_type <= REQ_WB;
                             l2_req_addr <= {tag[wr_idx], wr_idx, {OFF_BITS{1'b0}}};
-                            l2_req_wb_data <= line[wr_idx];
+                            l2_req_wb_data <= wr_line_corrected;
                             state[wr_idx] <= I;
                             fsm <= ST_EVICT_WB;
                         end else begin
@@ -264,19 +372,29 @@ module l1_cache #(
                         if (l2_req_type == REQ_UPGR) begin
                             // Already had the data (was S); just needed the
                             // other core invalidated. Apply the write now.
-                            line[op_idx] <= merge_write(line[op_idx], op_addr, op_wdata, op_func3);
+                            line[op_idx] <= op_write_value;
+                            line_check[op_idx] <= op_write_check;
                             state[op_idx] <= M;
+                            // Only branch here that actually reads our own
+                            // (possibly corrupted) stored line -- the other
+                            // two branches are fresh fills from L2, nothing
+                            // of ours to have faulted.
+                            access_sbe <= op_line_sbe; access_dbe <= op_line_dbe;
                             fsm <= ST_DONE_W;
                         end else if (is_write_op) begin
                             tag[op_idx] <= op_tag;
-                            line[op_idx] <= merge_write(l2_resp_data, op_addr, op_wdata, op_func3);
+                            line[op_idx] <= op_write_value;
+                            line_check[op_idx] <= op_write_check;
                             state[op_idx] <= M;
+                            access_sbe <= 1'b0; access_dbe <= 1'b0;
                             fsm <= ST_DONE_W;
                         end else begin
                             tag[op_idx] <= op_tag;
-                            line[op_idx] <= l2_resp_data;
+                            line[op_idx] <= op_write_value;
+                            line_check[op_idx] <= op_write_check;
                             state[op_idx] <= l2_resp_exclusive ? E : S;
-                            read_data_r <= extract_read(l2_resp_data, op_addr, op_func3);
+                            read_data_r <= extract_read(op_write_value, op_addr, op_func3);
+                            access_sbe <= 1'b0; access_dbe <= 1'b0;
                             fsm <= ST_DONE_R;
                         end
                     end

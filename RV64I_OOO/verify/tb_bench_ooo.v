@@ -47,11 +47,11 @@ module tb_bench_ooo #(
 
             if (!done0 && halt0_seen) begin
                 done0 = 1;
-                if (uut.core.t0_regfile0.registers[31] === PASS_CODE)
+                if (uut.core.t0_regfile0.data_mem[31] === PASS_CODE)
                     $display("[PASS] %0s | dual_issue=%0d | %0d cycles", TEST_NAME, ENABLE_DUAL_ISSUE, cycles);
                 else
                     $display("[FAIL] %0s | dual_issue=%0d | check #%0d | %0d cycles",
-                              TEST_NAME, ENABLE_DUAL_ISSUE, uut.core.t0_regfile0.registers[31], cycles);
+                              TEST_NAME, ENABLE_DUAL_ISSUE, uut.core.t0_regfile0.data_mem[31], cycles);
             end
             if (!done1 && halt1_seen) begin
                 done1 = 1;

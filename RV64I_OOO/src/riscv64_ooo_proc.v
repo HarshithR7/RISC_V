@@ -129,7 +129,9 @@
 //     if the two threads' loads/stores land in the same address space).
 //
 // Reused unchanged from the single-cycle RV64I core: program_counter.v,
-// instruction_fetch.v, register_file.v (written only at commit).
+// instruction_fetch.v. The architectural register file (written only at
+// commit) is Phase 9's ecc_register_file.v, an ECC-protected drop-in for
+// register_file.v -- see that file's own header.
 module riscv64_ooo_proc #(
     // Phase 7: one program image per thread -- see module header for why
     // this replaced Phase 1-6's single IMEM_FILE.
@@ -187,7 +189,19 @@ module riscv64_ooo_proc #(
     input [63:0] snoop_req_addr,
     output wire snoop_resp_hit,
     output wire snoop_resp_dirty,
-    output wire [L1_LINE_BYTES*8-1:0] snoop_resp_data
+    output wire [L1_LINE_BYTES*8-1:0] snoop_resp_data,
+
+    // Phase 9 (ECC): OR'd across all 4 architectural register-file
+    // instances (2 per thread -- see the "extra read port" note at their
+    // instantiation) -- see ecc_register_file.v.
+    output wire ecc_rf_sbe_fault,
+    output wire ecc_rf_dbe_fault,
+    // Phase 9 (ECC): this core's private L1 -- see l1_cache.v.
+    output wire ecc_l1_sbe_fault,
+    output wire ecc_l1_dbe_fault,
+    // Phase 9 (ECC): OR'd across both threads' ROBs -- see rob.v.
+    output wire ecc_rob_sbe_fault,
+    output wire ecc_rob_dbe_fault
 );
     localparam TB = $clog2(ROB_DEPTH);
     localparam VLEN = LANES * 32;
@@ -453,41 +467,59 @@ module riscv64_ooo_proc #(
 
     // Widened-commit support (Phase 5): both register_file instances per
     // thread get a second write port, fed identically.
+    // Phase 9 (ECC): all 4 instances below switched from the plain
+    // register_file.v to ecc_register_file.v -- same port list plus a
+    // sbe_fault/dbe_fault pair each, OR'd together into this module's own
+    // ecc_rf_sbe_fault/ecc_rf_dbe_fault outputs further down. See
+    // ecc_register_file.v's header for why this is a new file rather than
+    // an edit to the shared RV64I/src/register_file.v.
     wire [63:0] t0_rf0_read1, t0_rf0_read2, t0_rf1_read1, t0_rf1_read2;
-    register_file t0_regfile0 (
+    wire t0_rf0_sbe, t0_rf0_dbe, t0_rf1_sbe, t0_rf1_dbe;
+    ecc_register_file t0_regfile0 (
         .clk(clk), .reset(reset),
         .reg_write(t0_commit_rf_write_en),
         .read_reg1(t0_d0_rs1), .read_reg2(t0_d0_rs2), .write_reg(t0_commit_rf_write_reg),
         .write_data(t0_commit_rf_write_data),
         .read_data1(t0_rf0_read1), .read_data2(t0_rf0_read2),
-        .reg_write2(t0_commit_rf_write_en2), .write_reg2(t0_commit_rf_write_reg2), .write_data2(t0_commit_rf_write_data2)
+        .reg_write2(t0_commit_rf_write_en2), .write_reg2(t0_commit_rf_write_reg2), .write_data2(t0_commit_rf_write_data2),
+        .sbe_fault(t0_rf0_sbe), .dbe_fault(t0_rf0_dbe)
     );
-    register_file t0_regfile1 (
+    ecc_register_file t0_regfile1 (
         .clk(clk), .reset(reset),
         .reg_write(t0_commit_rf_write_en),
         .read_reg1(t0_d1_rs1), .read_reg2(t0_d1_rs2), .write_reg(t0_commit_rf_write_reg),
         .write_data(t0_commit_rf_write_data),
         .read_data1(t0_rf1_read1), .read_data2(t0_rf1_read2),
-        .reg_write2(t0_commit_rf_write_en2), .write_reg2(t0_commit_rf_write_reg2), .write_data2(t0_commit_rf_write_data2)
+        .reg_write2(t0_commit_rf_write_en2), .write_reg2(t0_commit_rf_write_reg2), .write_data2(t0_commit_rf_write_data2),
+        .sbe_fault(t0_rf1_sbe), .dbe_fault(t0_rf1_dbe)
     );
 
     wire [63:0] t1_rf0_read1, t1_rf0_read2, t1_rf1_read1, t1_rf1_read2;
-    register_file t1_regfile0 (
+    wire t1_rf0_sbe, t1_rf0_dbe, t1_rf1_sbe, t1_rf1_dbe;
+    ecc_register_file t1_regfile0 (
         .clk(clk), .reset(reset),
         .reg_write(t1_commit_rf_write_en),
         .read_reg1(t1_d0_rs1), .read_reg2(t1_d0_rs2), .write_reg(t1_commit_rf_write_reg),
         .write_data(t1_commit_rf_write_data),
         .read_data1(t1_rf0_read1), .read_data2(t1_rf0_read2),
-        .reg_write2(t1_commit_rf_write_en2), .write_reg2(t1_commit_rf_write_reg2), .write_data2(t1_commit_rf_write_data2)
+        .reg_write2(t1_commit_rf_write_en2), .write_reg2(t1_commit_rf_write_reg2), .write_data2(t1_commit_rf_write_data2),
+        .sbe_fault(t1_rf0_sbe), .dbe_fault(t1_rf0_dbe)
     );
-    register_file t1_regfile1 (
+    ecc_register_file t1_regfile1 (
         .clk(clk), .reset(reset),
         .reg_write(t1_commit_rf_write_en),
         .read_reg1(t1_d1_rs1), .read_reg2(t1_d1_rs2), .write_reg(t1_commit_rf_write_reg),
         .write_data(t1_commit_rf_write_data),
         .read_data1(t1_rf1_read1), .read_data2(t1_rf1_read2),
-        .reg_write2(t1_commit_rf_write_en2), .write_reg2(t1_commit_rf_write_reg2), .write_data2(t1_commit_rf_write_data2)
+        .reg_write2(t1_commit_rf_write_en2), .write_reg2(t1_commit_rf_write_reg2), .write_data2(t1_commit_rf_write_data2),
+        .sbe_fault(t1_rf1_sbe), .dbe_fault(t1_rf1_dbe)
     );
+
+    assign ecc_rf_sbe_fault = t0_rf0_sbe || t0_rf1_sbe || t1_rf0_sbe || t1_rf1_sbe;
+    assign ecc_rf_dbe_fault = t0_rf0_dbe || t0_rf1_dbe || t1_rf0_dbe || t1_rf1_dbe;
+
+    assign ecc_rob_sbe_fault = t0_rob_ecc_sbe || t1_rob_ecc_sbe;
+    assign ecc_rob_dbe_fault = t0_rob_ecc_dbe || t1_rob_ecc_dbe;
 
     wire [63:0] rf_read1  = active_thread ? t1_rf0_read1 : t0_rf0_read1;
     wire [63:0] rf_read2  = active_thread ? t1_rf0_read2 : t0_rf0_read2;
@@ -561,6 +593,7 @@ module riscv64_ooo_proc #(
     wire [63:0] t0_rob_rs1_value, t0_rob_rs2_value, t0_rob_rs1b_value, t0_rob_rs2b_value;
     wire t0_rob_vs1_done, t0_rob_vs2_done;
     wire [VLEN-1:0] t0_rob_vs1_value, t0_rob_vs2_value;
+    wire t0_rob_ecc_sbe, t0_rob_ecc_dbe;
 
     rob #(.DEPTH(ROB_DEPTH), .EXTRA_MARK_N(LSQ_DEPTH), .VLEN(VLEN)) t0_rob_i (
         .clk(clk), .reset(reset),
@@ -591,7 +624,8 @@ module riscv64_ooo_proc #(
         .head2_rd(t0_rob_head2_rd), .head2_value(t0_rob_head2_value),
         .head2_vec_value(t0_rob_head2_vec_value), .head2_is_vec_dest(t0_rob_head2_is_vec_dest),
         .head2_is_store(t0_rob_head2_is_store), .head2_is_ecall(t0_rob_head2_is_ecall),
-        .commit_req2(t0_rob_commit_req2)
+        .commit_req2(t0_rob_commit_req2),
+        .ecc_rob_sbe_fault(t0_rob_ecc_sbe), .ecc_rob_dbe_fault(t0_rob_ecc_dbe)
     );
 
     wire t1_rob_alloc_req, t1_rob_alloc2_req;
@@ -618,6 +652,7 @@ module riscv64_ooo_proc #(
     wire t1_rob_commit_req2;
     wire t1_rob_rs1_done, t1_rob_rs2_done, t1_rob_rs1b_done, t1_rob_rs2b_done;
     wire [63:0] t1_rob_rs1_value, t1_rob_rs2_value, t1_rob_rs1b_value, t1_rob_rs2b_value;
+    wire t1_rob_ecc_sbe, t1_rob_ecc_dbe;
 
     rob #(.DEPTH(ROB_DEPTH), .EXTRA_MARK_N(LSQ_DEPTH), .VLEN(VLEN)) t1_rob_i (
         .clk(clk), .reset(reset),
@@ -643,7 +678,8 @@ module riscv64_ooo_proc #(
         .head2_ready(t1_rob_head2_ready), .head2_tag(t1_rob_head2_tag), .head2_has_dest(t1_rob_head2_has_dest),
         .head2_rd(t1_rob_head2_rd), .head2_value(t1_rob_head2_value),
         .head2_is_store(t1_rob_head2_is_store), .head2_is_ecall(t1_rob_head2_is_ecall),
-        .commit_req2(t1_rob_commit_req2)
+        .commit_req2(t1_rob_commit_req2),
+        .ecc_rob_sbe_fault(t1_rob_ecc_sbe), .ecc_rob_dbe_fault(t1_rob_ecc_dbe)
     );
 
     wire rob_rs1_done  = active_thread ? t1_rob_rs1_done  : t0_rob_rs1_done;
@@ -938,7 +974,8 @@ module riscv64_ooo_proc #(
         .l2_req_wb_data(l2_req_wb_data),
         .l2_resp_valid(l2_resp_valid), .l2_resp_data(l2_resp_data), .l2_resp_exclusive(l2_resp_exclusive),
         .snoop_req_valid(snoop_req_valid), .snoop_req_type(snoop_req_type), .snoop_req_addr(snoop_req_addr),
-        .snoop_resp_hit(snoop_resp_hit), .snoop_resp_dirty(snoop_resp_dirty), .snoop_resp_data(snoop_resp_data)
+        .snoop_resp_hit(snoop_resp_hit), .snoop_resp_dirty(snoop_resp_dirty), .snoop_resp_data(snoop_resp_data),
+        .ecc_l1_sbe_fault(ecc_l1_sbe_fault), .ecc_l1_dbe_fault(ecc_l1_dbe_fault)
     );
 
     lsq #(.DEPTH(LSQ_DEPTH), .TAG_BITS(TB), .SBUF_DEPTH(SBUF_DEPTH)) lsq_i (

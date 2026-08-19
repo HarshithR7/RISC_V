@@ -47,31 +47,31 @@ module tb_dual_core #(
 
             if (!d00 && h00) begin
                 d00 = 1;
-                if (uut.core0.t0_regfile0.registers[31] === PASS_CODE)
+                if (uut.core0.t0_regfile0.data_mem[31] === PASS_CODE)
                     $display("[PASS-C0T0] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, c0t0_pc);
                 else
-                    $display("[FAIL-C0T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core0.t0_regfile0.registers[31], cycles, c0t0_pc);
+                    $display("[FAIL-C0T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core0.t0_regfile0.data_mem[31], cycles, c0t0_pc);
             end
             if (!d01 && h01) begin
                 d01 = 1;
-                if (uut.core0.t1_regfile0.registers[31] === PASS_CODE)
+                if (uut.core0.t1_regfile0.data_mem[31] === PASS_CODE)
                     $display("[PASS-C0T1] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, c0t1_pc);
                 else
-                    $display("[FAIL-C0T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core0.t1_regfile0.registers[31], cycles, c0t1_pc);
+                    $display("[FAIL-C0T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core0.t1_regfile0.data_mem[31], cycles, c0t1_pc);
             end
             if (!d10 && h10) begin
                 d10 = 1;
-                if (uut.core1.t0_regfile0.registers[31] === PASS_CODE)
+                if (uut.core1.t0_regfile0.data_mem[31] === PASS_CODE)
                     $display("[PASS-C1T0] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, c1t0_pc);
                 else
-                    $display("[FAIL-C1T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core1.t0_regfile0.registers[31], cycles, c1t0_pc);
+                    $display("[FAIL-C1T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core1.t0_regfile0.data_mem[31], cycles, c1t0_pc);
             end
             if (!d11 && h11) begin
                 d11 = 1;
-                if (uut.core1.t1_regfile0.registers[31] === PASS_CODE)
+                if (uut.core1.t1_regfile0.data_mem[31] === PASS_CODE)
                     $display("[PASS-C1T1] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, c1t1_pc);
                 else
-                    $display("[FAIL-C1T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core1.t1_regfile0.registers[31], cycles, c1t1_pc);
+                    $display("[FAIL-C1T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core1.t1_regfile0.data_mem[31], cycles, c1t1_pc);
             end
 
             if (d00 && d01 && d10 && d11) $finish;

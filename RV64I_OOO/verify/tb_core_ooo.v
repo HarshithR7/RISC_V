@@ -70,31 +70,31 @@ module tb_core_ooo #(
                 // convention as Phase 1-6's single-thread [REGS] line --
                 // see run_branch_free's header in build_tests_ooo.py.
                 $display("[REGS] x5=%h x6=%h x7=%h x8=%h x9=%h x10=%h",
-                          uut.core.t0_regfile0.registers[5], uut.core.t0_regfile0.registers[6],
-                          uut.core.t0_regfile0.registers[7], uut.core.t0_regfile0.registers[8],
-                          uut.core.t0_regfile0.registers[9], uut.core.t0_regfile0.registers[10]);
+                          uut.core.t0_regfile0.data_mem[5], uut.core.t0_regfile0.data_mem[6],
+                          uut.core.t0_regfile0.data_mem[7], uut.core.t0_regfile0.data_mem[8],
+                          uut.core.t0_regfile0.data_mem[9], uut.core.t0_regfile0.data_mem[10]);
                 // Vector register dump (v1-v4): thread-0-only (Phase 6/7
                 // scope), same permanent verification-hook convention as
                 // before (no vector store/extract instruction in scope).
                 $display("[VREGS] v1=%h v2=%h v3=%h v4=%h",
                           uut.core.vregfile_i.registers[1], uut.core.vregfile_i.registers[2],
                           uut.core.vregfile_i.registers[3], uut.core.vregfile_i.registers[4]);
-                if (uut.core.t0_regfile0.registers[31] === PASS_CODE)
+                if (uut.core.t0_regfile0.data_mem[31] === PASS_CODE)
                     $display("[PASS-T0] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out0);
                 else
-                    $display("[FAIL-T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core.t0_regfile0.registers[31], cycles, pc_out0);
+                    $display("[FAIL-T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core.t0_regfile0.data_mem[31], cycles, pc_out0);
             end
 
             if (!done1 && halt1_seen) begin
                 done1 = 1;
                 $display("[REGS1] x5=%h x6=%h x7=%h x8=%h x9=%h x10=%h",
-                          uut.core.t1_regfile0.registers[5], uut.core.t1_regfile0.registers[6],
-                          uut.core.t1_regfile0.registers[7], uut.core.t1_regfile0.registers[8],
-                          uut.core.t1_regfile0.registers[9], uut.core.t1_regfile0.registers[10]);
-                if (uut.core.t1_regfile0.registers[31] === PASS_CODE)
+                          uut.core.t1_regfile0.data_mem[5], uut.core.t1_regfile0.data_mem[6],
+                          uut.core.t1_regfile0.data_mem[7], uut.core.t1_regfile0.data_mem[8],
+                          uut.core.t1_regfile0.data_mem[9], uut.core.t1_regfile0.data_mem[10]);
+                if (uut.core.t1_regfile0.data_mem[31] === PASS_CODE)
                     $display("[PASS-T1] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out1);
                 else
-                    $display("[FAIL-T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core.t1_regfile0.registers[31], cycles, pc_out1);
+                    $display("[FAIL-T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core.t1_regfile0.data_mem[31], cycles, pc_out1);
             end
 
             if (done0 && done1) begin
