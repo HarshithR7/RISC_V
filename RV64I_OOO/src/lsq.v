@@ -11,8 +11,9 @@
 // store with an unresolved address always blocks, since aliasing can't be
 // ruled out. This project's Phase 1 does no store-to-load forwarding: an
 // aliasing older store simply blocks the load until that store leaves the
-// LSQ, which only happens at *commit* (see below) -- so "block until S
-// commits" falls out for free from "S is still resident."
+// LSQ, which used to mean "until commit" when memory access was instant
+// (Phase 1-6); see the store-buffer note below for what changed in
+// Phase 8.
 //
 // Stores never broadcast a value (no destination register); once both
 // their address and data operands are ready, they become commit-eligible
@@ -20,18 +21,56 @@
 // single entry -- multiple stores can legitimately become ready the same
 // cycle; the top level fans these into rob.v's extra_mark ports, which
 // tolerates exactly this "several simultaneous, always-distinct tags"
-// case by construction). The actual memory write happens only at commit
-// (driven by the top level from this module's commit_addr/data/func3),
-// preserving precise state exactly like the architectural register file.
+// case by construction).
 //
-// Only one data-memory access (the shared read/write address port) can be
-// used per cycle: `mem_port_busy` (asserted by the top level whenever a
-// store is committing its write this cycle) stalls load issue for
-// exactly that one cycle rather than racing the two accesses -- a real,
-// deliberately simple structural-hazard resolution.
+// Phase 8 (real L1/L2 cache + MESI): the flat, same-cycle data_memory.v
+// interface Phase 1-7 used is gone -- l1_cache.v is a genuinely multi-
+// cycle, blocking resource (a miss, or a coherency transaction, can take
+// many cycles; see its own header). Two consequences:
+//
+//   - Loads become a real outstanding-request operation, structurally
+//     the same category of thing div_rs.v already does for a multi-cycle
+//     divide: issue to l1_cache.v, wait for l1_read_valid, THEN broadcast
+//     on the CDB. Unlike a divide, though, a load's ROB entry can be
+//     squashed *while* the request is still outstanding at the cache
+//     (the cache itself has no notion of speculation) -- if that happens,
+//     the eventual response must be silently discarded, not broadcast to
+//     whatever unrelated instruction has since reused that same LSQ slot
+//     (see outstanding_squashed below).
+//
+//   - Store commit can no longer be "instant": actually acquiring
+//     ownership of a cache line (a coherency transaction) can take many
+//     cycles, but ROB retirement itself must stay exactly as fast as
+//     Phase 1-7 (nothing about *architectural* commit should get slower
+//     just because the memory subsystem got more realistic). The fix is
+//     a small store buffer: at the same moment a store used to fire its
+//     instant memory write, it now gets pushed into this buffer instead
+//     (its address is already fully resolved by commit time, so this is
+//     just a data-and-address handoff) and the LSQ slot vacates
+//     immediately, exactly like before. The buffer drains into l1_cache.v
+//     asynchronously, at whatever pace the cache can actually accept
+//     writes. A store buffer entry, having already committed, can never
+//     be squashed -- once pushed, it is unconditionally going to happen.
+//     Younger loads must additionally check the store buffer (not just
+//     LSQ-resident stores) for an address match before issuing; every
+//     buffered entry is, by construction, older than any still-resident
+//     LSQ instruction (in-order commit already guarantees that), so no
+//     age comparison is needed there, only an address check. If the
+//     buffer is ever full, a new store simply can't be pushed yet --
+//     store_buffer_full tells the top level to withhold that commit for
+//     a cycle, the same kind of space-available backpressure Phase 5's
+//     dual-commit already uses for the single store-memory-port conflict.
+//
+// Only one l1_cache.v access (its single blocking request port) can be
+// in flight at a time; issuing a new load is given priority over
+// draining a buffered store whenever both want it the same cycle -- a
+// load feeds dependent instructions waiting on the CDB, a buffered
+// store's only consequence (beyond eventually landing in the cache) is
+// filling up its own buffer, a slower-forming problem.
 module lsq #(
     parameter DEPTH = 4,
-    parameter TAG_BITS = 3
+    parameter TAG_BITS = 3,
+    parameter SBUF_DEPTH = 4
 )(
     input clk,
     input reset,
@@ -78,11 +117,11 @@ module lsq #(
     // Widened commit: which (thread, tag) is the *actual* committing
     // store this cycle -- head's if the head itself is a store, or
     // head2's if the head isn't a store but head+1 is and it's also
-    // committing (data_memory.v has one write port, so the top level
-    // never lets *both* head and head2 be committing stores the same
-    // cycle -- see riscv64_ooo_proc.v). commit_lookup_tid was added for
-    // Phase 7: tags alone are no longer unique once two threads' ROBs
-    // can both be issuing numerically identical tags.
+    // committing (only one store buffer push is accepted per cycle --
+    // see the top level for the single-store-commit-per-cycle
+    // arbitration this mirrors from Phase 5/7). commit_lookup_tid was
+    // added for Phase 7: tags alone are no longer unique once two
+    // threads' ROBs can both be issuing numerically identical tags.
     input commit_lookup_tid,
     input [TAG_BITS-1:0] commit_lookup_tag,
 
@@ -94,30 +133,35 @@ module lsq #(
     output [63:0] req_value,
     input req_grant,
 
-    // Shared data-memory read port (combinational).
-    input mem_port_busy,
-    output mem_read_req,
-    output [63:0] mem_read_addr,
-    output [2:0] mem_read_func3,
-    input [63:0] mem_read_data,
+    // ---- l1_cache.v CPU-side port (Phase 8) -- shared by load-issue and
+    // store-buffer-drain, one outstanding request at a time. ----
+    output l1_read_req,
+    output [63:0] l1_read_addr,
+    output [2:0] l1_read_func3,
+    input l1_read_valid,
+    input [63:0] l1_read_data,
+    output l1_write_req,
+    output [63:0] l1_write_addr,
+    output [63:0] l1_write_data,
+    output [2:0] l1_write_func3,
+    input l1_write_done,
+    input l1_busy,
 
-    // Per-slot store-readiness, fanned into rob.v's extra_mark ports by
-    // the top level -- see header for why this is an array, not a single
-    // pulse.
+    // Per-slot store readiness -> committable via rob.v's extra_mark
+    // ports, same as Phase 1-7 -- this doesn't change: it just means
+    // "this store's operands are known," not "this store has committed."
     output [DEPTH-1:0] store_ready,
     output [DEPTH*TAG_BITS-1:0] store_ready_tag_flat,
     output [DEPTH-1:0] store_ready_tid_flat,
 
-    // Commit-time store writeback: valid combinationally whenever some
-    // resident store's dest_tag matches rob_head_tag (at most one, by the
-    // ROB's own tag-uniqueness invariant). commit_fire (=rob_commit_req
-    // && rob_head_is_store, supplied by the top level) tells this module
-    // to vacate that matched entry this edge.
+    // Push a just-committed store into the store buffer this cycle --
+    // commit_fire replaces the old immediate-write trigger; the address
+    // is already resolved (entry_addr), so nothing but a data handoff and
+    // slot vacate happens here. store_buffer_full tells the top level to
+    // withhold this commit for a cycle if there's nowhere to put it.
     output commit_match,
-    output [63:0] commit_addr,
-    output [63:0] commit_data,
-    output [2:0] commit_func3,
     input commit_fire,
+    output store_buffer_full,
 
     // Phase 2 misprediction squash, now two independent per-thread ports
     // (Phase 7) -- see alu_rs.v's header for why a single muxed port can't
@@ -197,18 +241,60 @@ module lsq #(
             entry_addr[ai] = base_val[ai] + imm[ai];
     end
 
+    // ---- Store buffer (Phase 8) -----------------------------------------
+    reg sbuf_valid [0:SBUF_DEPTH-1];
+    reg sbuf_tid   [0:SBUF_DEPTH-1];
+    reg [63:0] sbuf_addr [0:SBUF_DEPTH-1];
+    reg [63:0] sbuf_data [0:SBUF_DEPTH-1];
+    reg [2:0]  sbuf_func3[0:SBUF_DEPTH-1];
+
+    integer sfi;
+    reg sbuf_have_free;
+    reg [31:0] sbuf_free_idx;
+    always @(*) begin
+        sbuf_have_free = 1'b0;
+        sbuf_free_idx = 0;
+        for (sfi = SBUF_DEPTH - 1; sfi >= 0; sfi = sfi - 1)
+            if (!sbuf_valid[sfi]) begin
+                sbuf_have_free = 1'b1;
+                sbuf_free_idx = sfi;
+            end
+    end
+    assign store_buffer_full = !sbuf_have_free;
+
+    // ---- Commit-time store lookup: which resident store (if any) has
+    // the exact (tid, tag) the top level says is committing this cycle
+    // -- at most one match, by the ROB's own tag-uniqueness invariant.
+    reg commit_match_r;
+    reg [31:0] commit_idx_r;
+    integer ci;
+    always @(*) begin
+        commit_match_r = 1'b0;
+        commit_idx_r = 0;
+        for (ci = 0; ci < DEPTH; ci = ci + 1) begin
+            if (busy[ci] && is_store_arr[ci] && tid_arr[ci] == commit_lookup_tid && dest_tag[ci] == commit_lookup_tag) begin
+                commit_match_r = 1'b1;
+                commit_idx_r = ci;
+            end
+        end
+    end
+    assign commit_match = commit_match_r;
+    wire do_commit_push = commit_fire && commit_match_r && sbuf_have_free;
+
     // ---- Disambiguation: which load slots are blocked by an older,
-    // still-resident store this cycle. Phase 7 (SMT): only stores from
-    // the *same thread* as the load are ever considered -- cross-thread
-    // memory ordering/consistency is explicitly out of scope for this
-    // integration (the same category of simplification as this whole
-    // project having no MMU/virtual memory), and there is no meaningful
-    // cross-thread notion of "older" to compare against anyway (each
-    // thread has its own ROB tag space). Independent test programs run
-    // correctly under this; two threads deliberately sharing addresses
-    // would not be safe, which is a documented limitation, not a bug.
+    // still-resident store this cycle, *or* by a same-thread store
+    // buffer entry (Phase 8 -- see module header: every buffered entry
+    // is unconditionally older than any still-resident LSQ instruction,
+    // and always has a fully-resolved address, so this is a plain
+    // address compare, no readiness/age check needed the way resident
+    // stores need). Phase 7 (SMT): only same-thread stores are ever
+    // considered -- cross-thread memory ordering/consistency is
+    // explicitly out of scope for this integration (the same category
+    // of simplification as this whole project having no MMU/virtual
+    // memory), and there is no meaningful cross-thread notion of "older"
+    // to compare against anyway (each thread has its own ROB tag space).
     reg blocked [0:DEPTH-1];
-    integer li, si;
+    integer li, si, sbi;
     always @(*) begin
         for (li = 0; li < DEPTH; li = li + 1) begin
             blocked[li] = 1'b0;
@@ -222,18 +308,29 @@ module lsq #(
                             blocked[li] = 1'b1;
                     end
                 end
+                for (sbi = 0; sbi < SBUF_DEPTH; sbi = sbi + 1) begin
+                    if (sbuf_valid[sbi] && sbuf_tid[sbi] == tid_arr[li] &&
+                        sbuf_addr[sbi][63:3] == entry_addr[li][63:3])
+                        blocked[li] = 1'b1;
+                end
             end
         end
     end
 
-    // ---- Issue: first ready, unblocked load (fixed lowest-index priority) ----
+    // ---- l1_cache.v arbitration + outstanding-operation tracking -------
+    // Load issue wins over store-buffer drain when both want the port;
+    // neither may issue while l1_busy (one outstanding request at a
+    // time) or while a load is already outstanding from this module's
+    // own last issue (l1_busy alone already covers that, but tracking it
+    // explicitly here is what lets a squash-while-outstanding be handled
+    // safely -- see below).
     integer ri;
     reg have_ready;
     reg [31:0] ready_idx;
     always @(*) begin
         have_ready = 1'b0;
         ready_idx = 0;
-        if (!mem_port_busy) begin
+        if (!l1_busy && !load_outstanding) begin
             for (ri = DEPTH - 1; ri >= 0; ri = ri - 1)
                 if (busy[ri] && !is_store_arr[ri] && base_ready[ri] && !blocked[ri]) begin
                     have_ready = 1'b1;
@@ -242,14 +339,63 @@ module lsq #(
         end
     end
 
-    assign mem_read_req   = have_ready;
-    assign mem_read_addr  = entry_addr[ready_idx];
-    assign mem_read_func3 = func3[ready_idx];
+    reg load_outstanding;
+    reg outstanding_squashed;
+    reg [31:0] outstanding_idx;
+    reg [TAG_BITS-1:0] outstanding_tag;
+    reg outstanding_tid;
 
-    assign req_valid = have_ready;
-    assign req_tid   = tid_arr[ready_idx];
-    assign req_tag   = dest_tag[ready_idx];
-    assign req_value = mem_read_data;
+    // Same category of bug this module's own load path already had to
+    // get right (see outstanding_idx above): l1_write_done pulses *while*
+    // l1_busy is still 1 (ST_DONE_W is itself a non-idle state in
+    // l1_cache.v -- see its own header), so a clear condition built from
+    // "!l1_busy && ...==the entry I'd pick right now" can never actually
+    // fire -- by the time done pulses, l1_busy blocks the very
+    // "currently draining" signal the clear was gated on, and
+    // sbuf_drain_idx is a live combinational pick that isn't guaranteed
+    // to still point at the right entry anyway. store_draining/
+    // draining_idx latch which entry is actually in flight the same way
+    // load_outstanding/outstanding_idx already do.
+    reg store_draining;
+    reg [31:0] draining_idx;
+
+    wire issue_load  = have_ready;
+    wire drain_store = !l1_busy && !load_outstanding && !issue_load && !store_draining && sbuf_valid[sbuf_drain_idx];
+
+    // Oldest-first drain: fixed lowest-index scan is enough here (a real
+    // FIFO would need head/tail bookkeeping for no behavioral benefit --
+    // every entry is already unconditionally safe to drain in any order,
+    // since none of them can alias *each other* differently than program
+    // order already guaranteed at commit time, and this buffer's only
+    // job is eventually getting each one out, not preserving a specific
+    // drain order beyond what correctness already requires).
+    integer sdi;
+    reg [31:0] sbuf_drain_idx;
+    always @(*) begin
+        sbuf_drain_idx = 0;
+        for (sdi = SBUF_DEPTH - 1; sdi >= 0; sdi = sdi - 1)
+            if (sbuf_valid[sdi])
+                sbuf_drain_idx = sdi;
+    end
+
+    assign l1_read_req   = issue_load;
+    assign l1_read_addr  = entry_addr[ready_idx];
+    assign l1_read_func3 = func3[ready_idx];
+
+    assign l1_write_req   = drain_store;
+    assign l1_write_addr  = sbuf_addr[sbuf_drain_idx];
+    assign l1_write_data  = sbuf_data[sbuf_drain_idx];
+    assign l1_write_func3 = sbuf_func3[sbuf_drain_idx];
+
+    // CDB request: only once the outstanding load's data has actually
+    // come back from l1_cache.v, and only if it wasn't squashed away in
+    // the meantime (outstanding_squashed) -- a squashed load's response
+    // is silently discarded, never broadcast onto a tag that may since
+    // have been reused by an unrelated instruction.
+    assign req_valid = load_outstanding && l1_read_valid && !outstanding_squashed;
+    assign req_tid    = outstanding_tid;
+    assign req_tag    = outstanding_tag;
+    assign req_value  = l1_read_data;
 
     // ---- Per-slot store readiness (address + data both known). tid is
     // exposed alongside the tag (Phase 7) so the top level can route each
@@ -263,35 +409,16 @@ module lsq #(
         end
     endgenerate
 
-    // ---- Commit-time store lookup (at most one match, by construction) ----
-    reg commit_match_r;
-    reg [63:0] commit_addr_r, commit_data_r;
-    reg [2:0] commit_func3_r;
-    integer ci;
-    always @(*) begin
-        commit_match_r = 1'b0;
-        commit_addr_r = 64'b0;
-        commit_data_r = 64'b0;
-        commit_func3_r = 3'b0;
-        for (ci = 0; ci < DEPTH; ci = ci + 1) begin
-            if (busy[ci] && is_store_arr[ci] && tid_arr[ci] == commit_lookup_tid && dest_tag[ci] == commit_lookup_tag) begin
-                commit_match_r = 1'b1;
-                commit_addr_r = entry_addr[ci];
-                commit_data_r = data_val[ci];
-                commit_func3_r = func3[ci];
-            end
-        end
-    end
-    assign commit_match = commit_match_r;
-    assign commit_addr  = commit_addr_r;
-    assign commit_data  = commit_data_r;
-    assign commit_func3 = commit_func3_r;
-
     integer vi;
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             for (vi = 0; vi < DEPTH; vi = vi + 1)
                 busy[vi] <= 1'b0;
+            for (vi = 0; vi < SBUF_DEPTH; vi = vi + 1)
+                sbuf_valid[vi] <= 1'b0;
+            load_outstanding <= 1'b0;
+            store_draining <= 1'b0;
+            outstanding_squashed <= 1'b0;
         end else begin
             for (vi = 0; vi < DEPTH; vi = vi + 1) begin
                 if (busy[vi] && !base_ready[vi] && cdbA_valid && tid_arr[vi] == cdbA_tid && base_tag[vi] == cdbA_tag) begin
@@ -339,27 +466,73 @@ module lsq #(
                 dest_tag[free_idx2]    <= alloc2_dest_tag;
             end
 
-            if (req_valid && req_grant) begin
-                busy[ready_idx] <= 1'b0;
+            // Issue a new outstanding load: latch everything the eventual
+            // response needs into dedicated regs (not re-read from the
+            // per-slot arrays later -- see module header on why: this
+            // slot could otherwise be squashed and reallocated to a
+            // completely different instruction before the response
+            // arrives).
+            if (issue_load) begin
+                load_outstanding <= 1'b1;
+                outstanding_squashed <= 1'b0;
+                outstanding_idx <= ready_idx;
+                outstanding_tag <= dest_tag[ready_idx];
+                outstanding_tid <= tid_arr[ready_idx];
+            end
+            if (load_outstanding && l1_read_valid) begin
+                load_outstanding <= 1'b0;
+                busy[outstanding_idx] <= 1'b0;
             end
 
-            if (commit_fire) begin
-                for (vi = 0; vi < DEPTH; vi = vi + 1)
-                    if (busy[vi] && is_store_arr[vi] && tid_arr[vi] == commit_lookup_tid && dest_tag[vi] == commit_lookup_tag)
-                        busy[vi] <= 1'b0;
+            // Push a committing store into the buffer (address already
+            // resolved -- entry_addr is combinational off base_val+imm,
+            // both of which store_ready already required to be known).
+            if (do_commit_push) begin
+                busy[commit_idx_r] <= 1'b0;
+                sbuf_valid[sbuf_free_idx] <= 1'b1;
+                sbuf_tid[sbuf_free_idx]   <= tid_arr[commit_idx_r];
+                sbuf_addr[sbuf_free_idx]  <= entry_addr[commit_idx_r];
+                sbuf_data[sbuf_free_idx]  <= data_val[commit_idx_r];
+                sbuf_func3[sbuf_free_idx] <= func3[commit_idx_r];
+            end
+
+            // Issue a new outstanding store-buffer drain, latching which
+            // entry it is (see store_draining's own comment above for why
+            // this can't just be re-derived from sbuf_drain_idx/drain_store
+            // at the moment the response actually arrives).
+            if (drain_store) begin
+                store_draining <= 1'b1;
+                draining_idx <= sbuf_drain_idx;
+            end
+            if (store_draining && l1_write_done) begin
+                store_draining <= 1'b0;
+                sbuf_valid[draining_idx] <= 1'b0;
             end
 
             if (squash0_valid) begin
                 for (vi = 0; vi < DEPTH; vi = vi + 1)
                     if (busy[vi] && !tid_arr[vi] &&
-                        age(1'b0, dest_tag[vi]) > age(1'b0, squash0_tag))
+                        age(1'b0, dest_tag[vi]) > age(1'b0, squash0_tag) &&
+                        !(load_outstanding && outstanding_idx == vi))
                         busy[vi] <= 1'b0;
+                // The outstanding load's own slot can't be freed yet (its
+                // cache request is still in flight) -- just mark it to be
+                // discarded, not broadcast, once the response finally
+                // arrives (see req_valid above and the l1_read_valid
+                // handler, which still frees the slot either way).
+                if (load_outstanding && !outstanding_tid &&
+                    age(1'b0, outstanding_tag) > age(1'b0, squash0_tag))
+                    outstanding_squashed <= 1'b1;
             end
             if (squash1_valid) begin
                 for (vi = 0; vi < DEPTH; vi = vi + 1)
                     if (busy[vi] && tid_arr[vi] &&
-                        age(1'b1, dest_tag[vi]) > age(1'b1, squash1_tag))
+                        age(1'b1, dest_tag[vi]) > age(1'b1, squash1_tag) &&
+                        !(load_outstanding && outstanding_idx == vi))
                         busy[vi] <= 1'b0;
+                if (load_outstanding && outstanding_tid &&
+                    age(1'b1, outstanding_tag) > age(1'b1, squash1_tag))
+                    outstanding_squashed <= 1'b1;
             end
         end
     end

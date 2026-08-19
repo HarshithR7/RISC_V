@@ -32,7 +32,12 @@ module tb_core_ooo #(
     integer cycles;
     reg done0, done1;
 
-    riscv64_ooo_proc #(.IMEM_FILE0(IMEM_FILE0), .IMEM_FILE1(IMEM_FILE1), .DMEM_FILE(DMEM_FILE)) uut (
+    // Phase 8: riscv64_ooo_proc.v no longer owns a backing memory directly
+    // (see its header) -- riscv64_ooo_proc_solo.v pairs it with a private
+    // l2_cache.v so single-core tests stay self-contained. Hierarchical
+    // references below go one level deeper (uut.core.*) than Phase 1-7's
+    // uut.* accordingly.
+    riscv64_ooo_proc_solo #(.IMEM_FILE0(IMEM_FILE0), .IMEM_FILE1(IMEM_FILE1), .DMEM_FILE(DMEM_FILE)) uut (
         .clk(clk), .reset(reset),
         .pc_out0(pc_out0), .pc_out1(pc_out1),
         .ecall_halt0(ecall_halt0), .ecall_halt1(ecall_halt1)
@@ -65,31 +70,31 @@ module tb_core_ooo #(
                 // convention as Phase 1-6's single-thread [REGS] line --
                 // see run_branch_free's header in build_tests_ooo.py.
                 $display("[REGS] x5=%h x6=%h x7=%h x8=%h x9=%h x10=%h",
-                          uut.t0_regfile0.registers[5], uut.t0_regfile0.registers[6],
-                          uut.t0_regfile0.registers[7], uut.t0_regfile0.registers[8],
-                          uut.t0_regfile0.registers[9], uut.t0_regfile0.registers[10]);
+                          uut.core.t0_regfile0.registers[5], uut.core.t0_regfile0.registers[6],
+                          uut.core.t0_regfile0.registers[7], uut.core.t0_regfile0.registers[8],
+                          uut.core.t0_regfile0.registers[9], uut.core.t0_regfile0.registers[10]);
                 // Vector register dump (v1-v4): thread-0-only (Phase 6/7
                 // scope), same permanent verification-hook convention as
                 // before (no vector store/extract instruction in scope).
                 $display("[VREGS] v1=%h v2=%h v3=%h v4=%h",
-                          uut.vregfile_i.registers[1], uut.vregfile_i.registers[2],
-                          uut.vregfile_i.registers[3], uut.vregfile_i.registers[4]);
-                if (uut.t0_regfile0.registers[31] === PASS_CODE)
+                          uut.core.vregfile_i.registers[1], uut.core.vregfile_i.registers[2],
+                          uut.core.vregfile_i.registers[3], uut.core.vregfile_i.registers[4]);
+                if (uut.core.t0_regfile0.registers[31] === PASS_CODE)
                     $display("[PASS-T0] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out0);
                 else
-                    $display("[FAIL-T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.t0_regfile0.registers[31], cycles, pc_out0);
+                    $display("[FAIL-T0] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core.t0_regfile0.registers[31], cycles, pc_out0);
             end
 
             if (!done1 && halt1_seen) begin
                 done1 = 1;
                 $display("[REGS1] x5=%h x6=%h x7=%h x8=%h x9=%h x10=%h",
-                          uut.t1_regfile0.registers[5], uut.t1_regfile0.registers[6],
-                          uut.t1_regfile0.registers[7], uut.t1_regfile0.registers[8],
-                          uut.t1_regfile0.registers[9], uut.t1_regfile0.registers[10]);
-                if (uut.t1_regfile0.registers[31] === PASS_CODE)
+                          uut.core.t1_regfile0.registers[5], uut.core.t1_regfile0.registers[6],
+                          uut.core.t1_regfile0.registers[7], uut.core.t1_regfile0.registers[8],
+                          uut.core.t1_regfile0.registers[9], uut.core.t1_regfile0.registers[10]);
+                if (uut.core.t1_regfile0.registers[31] === PASS_CODE)
                     $display("[PASS-T1] %0s | %0d cycles | PC=%h", TEST_NAME, cycles, pc_out1);
                 else
-                    $display("[FAIL-T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.t1_regfile0.registers[31], cycles, pc_out1);
+                    $display("[FAIL-T1] %0s | check #%0d | %0d cycles | PC=%h", TEST_NAME, uut.core.t1_regfile0.registers[31], cycles, pc_out1);
             end
 
             if (done0 && done1) begin

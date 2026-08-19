@@ -135,9 +135,7 @@ module riscv64_ooo_proc #(
     // this replaced Phase 1-6's single IMEM_FILE.
     parameter IMEM_FILE0 = "instructions0.mem",
     parameter IMEM_FILE1 = "instructions1.mem",
-    parameter DMEM_FILE = "data.mem",
     parameter IMEM_WORDS = 8192,
-    parameter DMEM_WORDS = 4096,
     parameter ROB_DEPTH = 8,
     parameter ALU_RS_DEPTH = 4,
     parameter MUL_RS_DEPTH = 2,
@@ -150,7 +148,16 @@ module riscv64_ooo_proc #(
     // Phase 6 (DLP): vector width -- SEW=32/LMUL=1 always, so VLEN =
     // LANES*32. Vector stays thread-0-only (see module header).
     parameter LANES = 4,
-    parameter VEC_RS_DEPTH = 2
+    parameter VEC_RS_DEPTH = 2,
+    // Phase 8 (cache/MESI): this core's own private L1 data cache and
+    // store buffer -- see l1_cache.v/lsq.v's headers. DMEM_FILE/
+    // DMEM_WORDS are gone from this module's own parameter list: the
+    // backing memory now lives behind a shared l2_cache.v, entirely
+    // external to this module (see the new l2_*/snoop_* ports below) --
+    // a single core no longer owns (or even can reach) memory directly.
+    parameter L1_LINES = 16,
+    parameter L1_LINE_BYTES = 32,
+    parameter SBUF_DEPTH = 4
     // BRANCH_RS and DIV_RS are fixed at exactly 1 entry per thread -- see
     // their headers for why that's not a knob worth exposing. NUM_THREADS
     // is likewise fixed at exactly 2 -- see module header for the scope
@@ -161,7 +168,26 @@ module riscv64_ooo_proc #(
     output wire [63:0] pc_out0,
     output wire [63:0] pc_out1,
     output wire ecall_halt0,
-    output wire ecall_halt1
+    output wire ecall_halt1,
+
+    // ---- Phase 8: this core's private L1's connection to the external,
+    // shared l2_cache.v -- see l1_cache.v's header for the protocol.
+    output wire l2_req_valid,
+    output wire [1:0] l2_req_type,
+    output wire [63:0] l2_req_addr,
+    output wire [L1_LINE_BYTES*8-1:0] l2_req_wb_data,
+    input l2_resp_valid,
+    input [L1_LINE_BYTES*8-1:0] l2_resp_data,
+    input l2_resp_exclusive,
+
+    // Coherency snoop: l2_cache.v asking this core's L1 about an address
+    // the *other* core is contending for.
+    input snoop_req_valid,
+    input [1:0] snoop_req_type,
+    input [63:0] snoop_req_addr,
+    output wire snoop_resp_hit,
+    output wire snoop_resp_dirty,
+    output wire [L1_LINE_BYTES*8-1:0] snoop_resp_data
 );
     localparam TB = $clog2(ROB_DEPTH);
     localparam VLEN = LANES * 32;
@@ -876,18 +902,13 @@ module riscv64_ooo_proc #(
         .squash1_valid(t1_mispredict), .squash1_tag(t1_branch_resolved_tag)
     );
 
-    // ---- Load-Store Queue + data memory (shared, tagged) -------------------
+    // ---- Load-Store Queue + private L1 cache (shared across threads, tagged)
     wire lsq_full, lsq_has_2_free;
     wire lsq_req_valid, lsq_req_tid;
     wire [TB-1:0] lsq_req_tag;
     wire [63:0] lsq_req_value;
-    wire lsq_mem_read_req;
-    wire [63:0] lsq_mem_read_addr;
-    wire [2:0] lsq_mem_read_func3;
-    wire [63:0] dmem_read_data;
     wire lsq_commit_match;
-    wire [63:0] lsq_commit_addr, lsq_commit_data;
-    wire [2:0] lsq_commit_func3;
+    wire lsq_store_buffer_full;
     wire [LSQ_DEPTH-1:0] lsq_store_ready;
     wire [LSQ_DEPTH*TB-1:0] lsq_store_ready_tag_flat;
     wire [LSQ_DEPTH-1:0] lsq_store_ready_tid_flat;
@@ -895,7 +916,32 @@ module riscv64_ooo_proc #(
     wire lane0_data_ready = d0_is_load || lane0_src2_ready;
     wire lane1_data_ready = d1_is_load || lane1_src2_ready;
 
-    lsq #(.DEPTH(LSQ_DEPTH), .TAG_BITS(TB)) lsq_i (
+    // ---- Phase 8: private L1 data cache (one per core, shared by both
+    // SMT threads -- like the shared RS banks, distinguished only by the
+    // tid each LSQ/store-buffer entry already carries, not by a second
+    // L1 instance). CPU-side ports wire directly to lsq_i; L2-side and
+    // snoop ports simply pass through to this module's own l2_*/snoop_*
+    // ports (see l1_cache.v's header for the full protocol).
+    wire l1_read_req; wire [63:0] l1_read_addr; wire [2:0] l1_read_func3;
+    wire l1_read_valid; wire [63:0] l1_read_data;
+    wire l1_write_req; wire [63:0] l1_write_addr, l1_write_data; wire [2:0] l1_write_func3;
+    wire l1_write_done, l1_busy;
+
+    l1_cache #(.LINES(L1_LINES), .LINE_BYTES(L1_LINE_BYTES), .ADDR_BITS(64)) l1_cache_i (
+        .clk(clk), .reset(reset),
+        .cpu_read_req(l1_read_req), .cpu_read_addr(l1_read_addr), .cpu_read_func3(l1_read_func3),
+        .cpu_read_valid(l1_read_valid), .cpu_read_data(l1_read_data),
+        .cpu_write_req(l1_write_req), .cpu_write_addr(l1_write_addr), .cpu_write_data(l1_write_data),
+        .cpu_write_func3(l1_write_func3), .cpu_write_done(l1_write_done),
+        .busy(l1_busy),
+        .l2_req_valid(l2_req_valid), .l2_req_type(l2_req_type), .l2_req_addr(l2_req_addr),
+        .l2_req_wb_data(l2_req_wb_data),
+        .l2_resp_valid(l2_resp_valid), .l2_resp_data(l2_resp_data), .l2_resp_exclusive(l2_resp_exclusive),
+        .snoop_req_valid(snoop_req_valid), .snoop_req_type(snoop_req_type), .snoop_req_addr(snoop_req_addr),
+        .snoop_resp_hit(snoop_resp_hit), .snoop_resp_dirty(snoop_resp_dirty), .snoop_resp_data(snoop_resp_data)
+    );
+
+    lsq #(.DEPTH(LSQ_DEPTH), .TAG_BITS(TB), .SBUF_DEPTH(SBUF_DEPTH)) lsq_i (
         .clk(clk), .reset(reset),
         .alloc_req(lane0_fire && (d0_is_load || d0_is_store)), .alloc_tid(active_thread),
         .alloc_is_store(d0_is_store), .alloc_func3(d0_func3), .alloc_imm(d0_imm),
@@ -915,14 +961,13 @@ module riscv64_ooo_proc #(
         .commit_lookup_tid(commit_lookup_tid), .commit_lookup_tag(commit_lookup_tag),
         .req_valid(lsq_req_valid), .req_tid(lsq_req_tid), .req_tag(lsq_req_tag), .req_value(lsq_req_value),
         .req_grant(lsq_grant),
-        .mem_port_busy(dmem_write_en),
-        .mem_read_req(lsq_mem_read_req), .mem_read_addr(lsq_mem_read_addr), .mem_read_func3(lsq_mem_read_func3),
-        .mem_read_data(dmem_read_data),
+        .l1_read_req(l1_read_req), .l1_read_addr(l1_read_addr), .l1_read_func3(l1_read_func3),
+        .l1_read_valid(l1_read_valid), .l1_read_data(l1_read_data),
+        .l1_write_req(l1_write_req), .l1_write_addr(l1_write_addr), .l1_write_data(l1_write_data),
+        .l1_write_func3(l1_write_func3), .l1_write_done(l1_write_done), .l1_busy(l1_busy),
         .store_ready(lsq_store_ready), .store_ready_tag_flat(lsq_store_ready_tag_flat),
         .store_ready_tid_flat(lsq_store_ready_tid_flat),
-        .commit_match(lsq_commit_match), .commit_addr(lsq_commit_addr), .commit_data(lsq_commit_data),
-        .commit_func3(lsq_commit_func3),
-        .commit_fire(dmem_write_en),
+        .commit_match(lsq_commit_match), .commit_fire(lsq_commit_fire), .store_buffer_full(lsq_store_buffer_full),
         .squash0_valid(t0_mispredict), .squash0_tag(t0_branch_resolved_tag),
         .squash1_valid(t1_mispredict), .squash1_tag(t1_branch_resolved_tag)
     );
@@ -934,12 +979,19 @@ module riscv64_ooo_proc #(
     wire [LSQ_DEPTH-1:0] t1_lsq_extra_mark_valid = lsq_store_ready &  lsq_store_ready_tid_flat;
 
     // Widened commit + Phase 7 cross-thread store-port arbitration: at most
-    // one store across BOTH threads' ROBs commits per cycle (data_memory.v
-    // has one write port). Thread 0 has fixed priority; if thread 1 also
-    // wants the port this cycle, thread 1's contended commit is suppressed
-    // -- its whole commit (not just head2) if thread 1's own head was the
-    // contended store, since in-order commit means head2 can never retire
-    // past a blocked head. See module header.
+    // one store across BOTH threads' ROBs commits per cycle -- not because
+    // of a physical memory port anymore (Phase 8's store buffer decouples
+    // that), but because lsq_i still exposes exactly one commit_fire/
+    // commit_lookup_tid/commit_lookup_tag port (deliberately not widened
+    // to two -- the store buffer already absorbs the real back-pressure
+    // concern a second port would have addressed). Thread 0 has fixed
+    // priority; if thread 1 also wants the port this cycle, thread 1's
+    // contended commit is suppressed -- its whole commit (not just head2)
+    // if thread 1's own head was the contended store, since in-order
+    // commit means head2 can never retire past a blocked head. See module
+    // header. Phase 8 additionally requires !lsq_store_buffer_full: a
+    // store cannot be considered a commit candidate at all if there's
+    // nowhere to push it, regardless of which thread "wins" arbitration.
     // Bug fix (present since Phase 5, only exposed by Phase 7's SMT
     // timing): head2_ready can legitimately go true (marked done via its
     // own CDB broadcast) cycles before head_ready does -- head and head2
@@ -955,10 +1007,17 @@ module riscv64_ooo_proc #(
     // program-order-*later* instruction had already prematurely written).
     // Fixing this once here, at the source, rather than patching every
     // downstream use site.
+    wire sbuf_ok = !lsq_store_buffer_full;
+
     wire t0_commit2_store_conflict = t0_rob_head_is_store && t0_rob_head2_is_store;
     wire t0_commit2_vec_conflict   = t0_rob_head_is_vec_dest && t0_rob_head2_is_vec_dest;
-    assign t0_rob_commit_req  = t0_rob_head_ready;
-    assign t0_rob_commit_req2 = t0_rob_commit_req && t0_rob_head2_ready && !t0_commit2_store_conflict && !t0_commit2_vec_conflict;
+    wire t0_head_wants_store       = t0_rob_head_ready  && t0_rob_head_is_store;
+    wire t0_head2_wants_store_cand = t0_rob_head2_ready && !t0_commit2_store_conflict && t0_rob_head2_is_store;
+    wire t0_head1_sbuf_block = t0_head_wants_store && !sbuf_ok;
+    wire t0_head2_sbuf_block = t0_head2_wants_store_cand && !sbuf_ok;
+    assign t0_rob_commit_req  = t0_rob_head_ready && !t0_head1_sbuf_block;
+    assign t0_rob_commit_req2 = t0_rob_commit_req && t0_rob_head2_ready && !t0_commit2_store_conflict &&
+                                 !t0_commit2_vec_conflict && !t0_head2_sbuf_block;
 
     wire t0_commit_store_is_head1 = t0_rob_commit_req  && t0_rob_head_is_store;
     wire t0_commit_store_is_head2 = t0_rob_commit_req2 && t0_rob_head2_is_store;
@@ -969,9 +1028,9 @@ module riscv64_ooo_proc #(
     wire t1_commit_store_is_head2_cand = t1_rob_head2_ready && !t1_commit2_store_conflict && t1_rob_head2_is_store;
     wire t1_wants_store_cand = t1_commit_store_is_head1_cand || t1_commit_store_is_head2_cand;
 
-    wire t1_blocked_by_t0 = t1_wants_store_cand && t0_wants_store;
-    wire t1_head1_store_blocked = t1_commit_store_is_head1_cand && t1_blocked_by_t0;
-    wire t1_head2_store_blocked = t1_commit_store_is_head2_cand && t1_blocked_by_t0;
+    wire t1_blocked_by_t0_or_sbuf = t1_wants_store_cand && (t0_wants_store || !sbuf_ok);
+    wire t1_head1_store_blocked = t1_commit_store_is_head1_cand && t1_blocked_by_t0_or_sbuf;
+    wire t1_head2_store_blocked = t1_commit_store_is_head2_cand && t1_blocked_by_t0_or_sbuf;
 
     // Same do_commit1-equivalent gate as t0's fix above (t1_rob_commit_req
     // already folds in the cross-thread store-port block, so requiring it
@@ -986,9 +1045,10 @@ module riscv64_ooo_proc #(
     // At most one of these four is ever true, by construction (intra-thread
     // conflicts already prevent a thread's own head+head2 both being
     // stores; the cross-thread arbiter above ensures at most one thread
-    // wins the port).
-    wire dmem_write_en = t0_commit_store_is_head1 || t0_commit_store_is_head2 ||
-                          t1_commit_store_is_head1 || t1_commit_store_is_head2;
+    // wins the single commit_fire port, gated on the store buffer actually
+    // having room).
+    wire lsq_commit_fire = t0_commit_store_is_head1 || t0_commit_store_is_head2 ||
+                            t1_commit_store_is_head1 || t1_commit_store_is_head2;
     wire commit_lookup_tid = t0_commit_store_is_head1 ? 1'b0 :
                               t0_commit_store_is_head2 ? 1'b0 :
                               t1_commit_store_is_head1 ? 1'b1 :
@@ -1009,16 +1069,6 @@ module riscv64_ooo_proc #(
     assign vec_commit_clear_en_w   = vec_commit_write_en_w;
     assign vec_commit_clear_rd_w   = vec_commit_write_reg_w;
     assign vec_commit_clear_tag_w  = t0_commit_vec_is_head1 ? t0_rob_head_tag : t0_rob_head2_tag;
-
-    data_memory #(.DMEM_FILE(DMEM_FILE), .DMEM_WORDS(DMEM_WORDS)) dmem_i (
-        .clk(clk),
-        .mem_read(lsq_mem_read_req), .mem_write(dmem_write_en),
-        .func3(dmem_write_en ? lsq_commit_func3 : lsq_mem_read_func3),
-        .mem_addr(dmem_write_en ? lsq_commit_addr : lsq_mem_read_addr),
-        .write_data(lsq_commit_data),
-        .read_data(dmem_read_data),
-        .vmem_read(1'b0), .vmem_write(1'b0), .vmem_addr(64'b0), .vmem_write_data(128'b0)
-    );
 
     // ================================================================
     // ---- Branch-class reservation stations (per thread) -------------

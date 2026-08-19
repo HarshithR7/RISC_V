@@ -34,7 +34,8 @@ REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "da
               "vector_register_file.v", "vector_alu.v"]
 # New for the out-of-order core.
 OOO_RTL = ["decode_ooo.v", "rat.v", "vec_rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v",
-           "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "riscv64_ooo_proc.v"]
+           "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "l1_cache.v", "l2_cache.v",
+           "riscv64_ooo_proc.v", "riscv64_ooo_proc_solo.v"]
 
 
 class TestBuilder:
@@ -367,6 +368,39 @@ li x7, 6
 bne x6, x7, loop
 """)
     t.check_eq("x5", 15)  # 1+2+3+4+5
+    return t
+
+
+def t_stable_operand_loop():
+    # Regression test for a real rat.v bug found via a Phase 8 dual-core
+    # coherency test (a producer/consumer polling loop): unlike
+    # t_backward_branch_loop above, where *both* of bne's operands are
+    # freshly re-produced every iteration, this loop's second comparison
+    # operand (x10) is written *once*, before the loop, and never again --
+    # every iteration's bne reads the same long-committed value. If that
+    # register's own commit happens to land on the *exact same cycle* as
+    # a later branch's checkpoint_save (a real, if narrow, timing
+    # coincidence -- not exercised by any pre-Phase-8 test, since this
+    # project's memory access used to be single-cycle, changing the whole
+    # relative timing), the checkpoint could capture "still busy" instead
+    # of the just-applied commit-clear, permanently wedging that
+    # register's RAT entry on a tag that's since been recycled by
+    # unrelated instructions -- see rat.v's checkpoint_save header for the
+    # full mechanism and fix. This loop doesn't strictly guarantee hitting
+    # that exact cycle coincidence on every run (it depends on relative
+    # dispatch/commit timing), but it's the minimal single-core shape that
+    # can, and is cheap insurance either way.
+    t = TestBuilder("ooo_stable_operand_loop")
+    t.asm("""
+li x10, 5
+li x5, 0
+li x6, 1
+loop:
+add x5, x5, x6
+addi x6, x6, 1
+bne x6, x10, loop
+""")
+    t.check_eq("x5", 10)  # 1+2+3+4
     return t
 
 
@@ -906,6 +940,7 @@ def main():
         results.append(line)
 
     for fn in [t_branch_taken_not_taken, t_jal_jalr, t_war_hazard, t_waw_hazard, t_backward_branch_loop,
+               t_stable_operand_loop,
                t_mul_basic, t_mulw, t_mul_rs_exhaustion,
                t_div_basic, t_div_by_zero, t_divw, t_div_back_to_back,
                t_store_load_alias, t_store_load_no_alias, t_store_load_widths,

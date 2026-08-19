@@ -114,6 +114,20 @@ module rat #(
     // rather than just slow. checkpoint_restore then overwrites live
     // busy[]/tag[] from the (kept-current) shadow, discarding every
     // rename caused by the now-squashed speculative instructions.
+    //
+    // Same-cycle edge case (found via a real dual-core coherency test, not
+    // by inspection -- a tight polling loop's own comparison register
+    // happened to commit on the exact same cycle its own consuming branch
+    // dispatched): if a register's commit_clear_en fires the *same* cycle
+    // as checkpoint_save, the mirror-clear above and this bulk copy both
+    // target busy_cp[] for that register, and the bulk copy comes later
+    // in program order -- so it would win, capturing the *pre*-clear
+    // "still busy" live value into the checkpoint, discarding the mirror.
+    // Since the committing instruction is always older than the branch
+    // (commit is strictly in-order and the branch hasn't committed yet),
+    // a same-cycle commit is unconditionally real and must be reflected
+    // in the checkpoint too -- so the copy loop below checks for exactly
+    // this collision itself, rather than trusting the mirror step alone.
     input checkpoint_save,
     input checkpoint_restore
 );
@@ -171,8 +185,16 @@ module rat #(
 
             if (checkpoint_save) begin
                 for (i = 1; i < 32; i = i + 1) begin
-                    busy_cp[i] <= busy[i];
-                    tag_cp[i]  <= tag[i];
+                    tag_cp[i] <= tag[i];
+                    // See the same-cycle edge case note above: a commit
+                    // clearing register i this exact cycle must be
+                    // reflected in the checkpoint as not-busy, not copied
+                    // from the pre-clear live value.
+                    if ((commit_clear_en  && commit_rd  == i && tag[i] == commit_tag) ||
+                        (commit_clear_en2 && commit_rd2 == i && tag[i] == commit_tag2))
+                        busy_cp[i] <= 1'b0;
+                    else
+                        busy_cp[i] <= busy[i];
                 end
             end
 

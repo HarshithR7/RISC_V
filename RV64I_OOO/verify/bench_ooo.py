@@ -28,7 +28,8 @@ import asm64 as asm  # noqa: E402
 REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "data_memory.v",
               "vector_register_file.v", "vector_alu.v"]
 OOO_RTL = ["decode_ooo.v", "rat.v", "vec_rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v",
-           "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "riscv64_ooo_proc.v"]
+           "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "l1_cache.v", "l2_cache.v",
+           "riscv64_ooo_proc.v", "riscv64_ooo_proc_solo.v"]
 
 
 class Bench:

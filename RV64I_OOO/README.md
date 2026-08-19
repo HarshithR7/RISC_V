@@ -12,9 +12,10 @@ RV64IMACFD+RVV feature set.
 
 ## Status
 
-**Phases 1 through 7 are all complete: 32/32 full-pipeline tests pass**,
-plus 21/21 isolated ROB+RAT unit-test checks and 15/15 standalone divider
-unit tests.
+**Phases 1 through 8 are all complete: 33/33 single-core full-pipeline
+tests pass, plus a dedicated 2-core coherency test**, plus 21/21 isolated
+ROB+RAT unit-test checks, 15/15 standalone divider unit tests, and 13/13
+isolated L1/L2 MESI coherency checks.
 
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
@@ -40,6 +41,10 @@ unit tests.
   — see "Phase 6: data-level parallelism (vector)" below.
 - **Phase 7**: 2-thread simultaneous multithreading (SMT) — see "Phase 7:
   simultaneous multithreading" below.
+- **Phase 8**: a real 2-core system with private L1 data caches, a shared
+  L2, and genuine MESI coherency, wired all the way into the OoO
+  pipeline's actual load/store execution — see "Phase 8: multi-level
+  cache + MESI coherency" below.
 
 Tests cover RAW/WAR/WAW hazards (including intra-group ones specific to
 2-wide dispatch), a real backward-branch loop (which, as a side effect of
@@ -829,3 +834,170 @@ result):
   unrelated long-latency work starve the other's ready-and-waiting head.
 
 32/32 total.
+
+## Phase 8: multi-level cache + MESI coherency
+
+Adds a real 2-core system: private per-core L1 data caches, a shared L2,
+and genuine MESI coherency (M/E/S/I, snooping, dirty forwarding) wired
+all the way into the OoO pipeline's actual load/store execution — not
+just a standalone protocol simulation. Originally scoped as "2-core
+L1+L2 with real MESI," the user explicitly chose the larger of two
+integration options: full pipeline integration (reworking the LSQ's
+load/store execution into a real, variable-latency, outstanding-request
+protocol) over a standalone-but-not-wired-in subsystem.
+
+This phase was built and verified in two stages, matching this project's
+established discipline of testing new, bug-prone logic in isolation
+before wiring it into the pipeline:
+
+### Stage 1: the coherency subsystem itself
+
+- **`l1_cache.v`**: a private per-core, direct-mapped, write-back data
+  cache with a real 4-state MESI machine. Blocking — one outstanding
+  request at a time, the same "real, multi-cycle, but not pipelined"
+  scope `div_fu.v` already established. An eviction's old occupant (if
+  dirty) is written back to L2 *before* the new line is ever requested,
+  so the affected set is genuinely Invalid for the whole time a request
+  is outstanding — this is what keeps a same-index snoop arriving during
+  that window trivially correct without needing to reason about a new,
+  not-yet-installed line being snoop-visible early.
+- **`l2_cache.v`**: shared, inclusive, write-through to the backing
+  memory, and the coherence *director* for exactly 2 L1s (fixed-priority
+  arbitration, one transaction in flight at a time — a deliberately
+  simple, appropriate choice for a 2-requester coherence point). Doesn't
+  need to track M/E/S for its own copy, only a "valid" bit plus two
+  presence bits (a directory, not a third MESI level) — see its own
+  header for why the directory is a safe over-approximation, not exact
+  bookkeeping, and the one case (an L2-internal replacement) where it
+  must stay precise. Reuses `data_memory.v`'s existing RVV vector port,
+  unmodified, as a natural whole-cache-line memory interface — Phase 6
+  never puts real traffic on that port (vector load/store was explicitly
+  out of scope there), so it was sitting unused.
+- **`tb_cache_mesi.v`**: drives two `l1_cache.v` instances and one
+  `l2_cache.v` directly (no OoO core involved), proving real MESI state
+  transitions before any pipeline wiring: write-miss → M, read-miss with
+  dirty-snoop-forwarding (M → S downgrade plus data forward through L2),
+  a Shared-line write upgrading to M while invalidating the other core,
+  re-forwarding a *newer* dirty value after invalidation, and both clean
+  and dirty (writeback) eviction. 13/13 checks.
+
+Two real bugs were found and fixed during this stage, both classic
+same-cycle Verilog timing mistakes rather than protocol-design errors:
+asserting a snoop request via a non-blocking assignment and then trying
+to read its resulting *combinational* response in the same clocked
+block (an NBA update isn't visible until the next cycle — fixed by
+driving the snoop request outputs combinationally instead, off `l2_cache.v`'s
+own FSM state directly); and a one-cycle race in the L1↔L2 handshake
+where L2 could return to idle and re-sample a requester's request line
+one edge before that requester's own clear of it became visible,
+spuriously replaying the just-completed transaction (fixed with a
+one-cycle cooldown state before L2 re-arms).
+
+### Stage 2: full pipeline integration
+
+- **`lsq.v`**: loads become a genuine outstanding-request operation —
+  structurally the same category of thing `div_rs.v` already does for a
+  multi-cycle divide (issue, wait for `l1_read_valid`, then broadcast on
+  the CDB) — but with one wrinkle a divide never has: a load's ROB entry
+  can be squashed *while the request is still outstanding at the cache*.
+  If that happens, the eventual response is silently discarded
+  (`outstanding_squashed`), never broadcast onto a tag that may since
+  have been reused by an unrelated instruction.
+- **A small store buffer**, also new in `lsq.v`: store commit can no
+  longer be instant (acquiring a cache line can take many cycles), but
+  ROB retirement itself must stay exactly as fast as Phase 1-7 — nothing
+  about *architectural* commit should slow down just because memory got
+  more realistic. A committing store is handed off into a 4-entry buffer
+  (address already resolved by commit time) and the LSQ slot vacates
+  immediately, exactly as before; the buffer drains into `l1_cache.v`
+  asynchronously. A buffered entry, having already committed, can never
+  be squashed. Younger loads additionally check the buffer (not just
+  LSQ-resident stores) for an address match — every buffered entry is
+  unconditionally older than any still-resident LSQ instruction, so this
+  needs a plain address compare, no age logic. If the buffer is ever
+  full, `store_buffer_full` withholds that commit for a cycle — the same
+  kind of space-available backpressure Phase 5's dual-commit already
+  uses for the single-store-port conflict.
+- **`riscv64_ooo_proc.v`** gained a private `l1_cache_i` (shared across
+  both SMT threads, distinguished by the `tid` each LSQ/store-buffer
+  entry already carries) and lost its direct `data_memory.v` instance —
+  a single core no longer owns, or can even reach, memory directly; new
+  `l2_*`/`snoop_*` ports connect to an external `l2_cache.v`.
+  `DMEM_FILE`/`DMEM_WORDS` are gone from this module's own parameter
+  list accordingly.
+- **`riscv64_ooo_proc_solo.v`** (new): pairs one core with a private
+  `l2_cache.v` (core 1's side simply tied off) so every single-core
+  testbench keeps the same simple, self-contained "just instantiate this
+  one module" surface Phase 1-7 had.
+- **`dual_core_riscv64_ooo.v`** (new): two real cores sharing one
+  `l2_cache.v` — the genuine 2-core system.
+
+### A real, latent bug found here — not introduced by Phase 8, only exposed by it
+
+The dual-core producer/consumer test (below) initially hung: core 0
+correctly wrote a data word and a flag word; core 1's polling loop
+never observed the flag. Hand-tracing (the same technique that found
+every non-trivial bug in this project) eventually showed the *cached
+data itself* was correct — the bug was in `rat.v`, present since Phase 2,
+and had simply never been exercised by any prior test.
+
+`rat.v`'s checkpoint/restore mechanism (see its own header) mirrors
+every commit-clear into a shadow copy during a speculative window, so
+that a misprediction's restore doesn't resurrect an already-committed
+register as "still busy." But when a register's own commit-clear lands
+on the *exact same cycle* as a `checkpoint_save` (a real timing
+coincidence, not a corner case invented to test the fix — it happened
+naturally here because a stable, once-set comparison register's commit
+happened to coincide with the next loop iteration's branch dispatching
+its own checkpoint), the checkpoint's bulk copy — which reads the
+*pre-edge*, not-yet-cleared live `busy[]` — overwrote the shadow's
+mirrored clear, since the bulk copy comes later in program order.  The
+checkpoint then permanently "remembered" that register as busy on a tag
+whose producer had already committed; once a later misprediction
+restored from that checkpoint, the register was wedged waiting on a tag
+that real, unrelated instructions kept recycling and rebroadcasting —
+so every read of it silently returned whatever *that* unrelated
+instruction had just computed, forever. This is exactly why the
+resolved branch value looked like a fragment of a totally unrelated
+`li` sequence elsewhere in the program: it was one, read through a
+stale tag.
+
+No pre-Phase-8 test ever triggered this: Phase 1-6's memory access was
+single-cycle, so the specific relative timing between a stable
+register's commit and a later branch's own dispatch never lined up this
+way, and no existing test has a *stable* (set-once, read-repeatedly
+across many loop iterations) comparison operand in the first place —
+every prior loop test re-produces both branch operands every iteration.
+Fixed once, in `checkpoint_save`'s own copy loop: for any register a
+same-cycle commit-clear targets, the checkpoint now captures "not busy"
+directly, instead of trusting the (racing) mirror step alone.
+`t_stable_operand_loop` (a minimal single-core reproduction of this
+exact shape) was added to `build_tests_ooo.py` as a regression test,
+though the underlying race is a genuine timing coincidence, not
+something a fixed test program can force on every run with certainty.
+
+### Tests
+
+- **`tb_cache_mesi.v`**: 13/13, described above.
+- **`t_stable_operand_loop`**: the RAT checkpoint-race regression test,
+  described above. All 33 single-core tests (29 pre-existing + this one
+  + `t_smt_*`... — see Phase 7's count) pass unmodified otherwise, since
+  the cache/store-buffer timing change is invisible to correctness
+  checks that only look at final values, not cycle counts.
+- **`build_dual_core_tests.py`**'s **`t_producer_consumer`**: the real
+  payoff test. Core 0 writes a data word, then a flag word, both through
+  its own private L1 and the new store buffer. Core 1 busy-polls the
+  flag through its own, entirely separate L1 until it observes the
+  write — which can only happen if core 1's load-miss on the flag
+  address genuinely triggers a coherency snoop of core 0's L1 (or a
+  correctly-updated L2) and keeps re-checking (a fresh L1 miss/re-snoop
+  each loop iteration, since a cached copy would otherwise never observe
+  a later write) until the real MESI transaction actually delivers the
+  new value — then checks it reads the *data* value core 0 actually
+  wrote, not stale or zero memory. This is the genuine end-to-end proof
+  that a value committed by one core becomes visible on the other only
+  via a real cross-core coherency transaction, running through the full
+  OoO pipeline, not a scripted protocol test.
+
+33/33 single-core, plus the dual-core coherency test, plus 13/13
+isolated MESI checks.
