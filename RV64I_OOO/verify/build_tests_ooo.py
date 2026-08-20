@@ -35,7 +35,8 @@ REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "da
 # New for the out-of-order core.
 OOO_RTL = ["decode_ooo.v", "rat.v", "vec_rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v",
            "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "l1_cache.v", "l2_cache.v",
-           "ecc64.v", "ecc_line.v", "ecc_register_file.v", "instruction_fetch_reg.v", "data_memory_axi.v",
+           "ecc64.v", "ecc_line.v", "ecc_register_file.v", "instruction_fetch_reg.v",
+           "instruction_fetch_axi.v", "data_memory_axi.v",
            "riscv64_ooo_proc.v", "riscv64_ooo_proc_solo.v"]
 
 

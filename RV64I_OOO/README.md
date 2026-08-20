@@ -19,8 +19,8 @@ isolated L1/L2 MESI coherency checks, 2/2 lockstep DMR checks, 6/6
 isolated ECC checks, and 3/3 isolated Phase 10 memory-optimization
 checks (prefetch, hit-under-miss, merging write buffer) — all still
 passing, unchanged, after Phase 11's fetch-latency retiming and Phase
-12's AXI-loadable backing memory, both for real FPGA bring-up (see
-below), plus 3 new isolated Phase 12 checks of its own.
+12's AXI-loadable backing *and* instruction memory, both for real FPGA
+bring-up (see below), plus 4 new isolated Phase 12 checks of its own.
 
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
@@ -1575,9 +1575,46 @@ at all.
 - **Zero regressions**: the full pre-existing suite -- 33/33 single-core,
   the dual-core coherency test, both lockstep checks, and all 6
   benchmarks -- passes unchanged.
-- **Not done yet**: the instruction-memory side of AXI loading (with its
-  own wrinkle -- each thread's 2-wide fetch uses two independent physical
-  memory copies of the same content, per `riscv64_ooo_proc.v`'s existing
-  `t0_if0`/`t0_if1` design, so AXI writes need to be mirrored to both),
-  the AXI-lite control/status register block, the top-level FPGA wrapper,
-  and all Vivado/PYNQ-side work.
+
+### Instruction memory
+
+Same pattern applied to the fetch side, with one wrinkle: each thread's
+2-wide fetch (`t0_if0`/`t0_if1`) uses two independent physical memory
+copies of the *same* content, so a single AXI write per thread needs
+mirroring to both instances, not just one.
+
+- **`instruction_fetch_axi.v`** (new): a registered-read, AXI-writable
+  instruction memory -- the AXI-loadable counterpart to
+  `instruction_fetch_reg.v`'s simulation-only `$readmemh` path. Not a
+  wrapper around `instruction_fetch.v` (unlike that module's default
+  path): the original has no write port at all, so a clean reimplementation
+  is simplest, same reasoning as `data_memory_axi.v` vs `data_memory.v`.
+- **`instruction_fetch_reg.v`** gained its own `USE_AXI_MEM` parameter
+  (default 0), selecting via `generate if` between its existing
+  `instruction_fetch.v`-wrapping path and `instruction_fetch_axi.v`. This
+  needed the module's `instruction` output changed from `output reg` to
+  `output wire`, since one branch now drives it via a submodule's own
+  output port (which requires a wire) and the other via a continuous
+  assign from an internal register -- a syntax-level restructuring only;
+  the default path's actual timing is unchanged (confirmed by identical
+  cycle counts across the full regression before and after).
+- **`riscv64_ooo_proc.v`** gained a `USE_AXI_MEM` parameter and one
+  `t{0,1}_imem_axi_wr_{en,addr,data}` port set per thread, each mirrored
+  internally to that thread's own `if0`/`if1` instances -- callers only
+  ever drive one write per thread, never worrying about the two-copy
+  detail underneath. **`dual_core_riscv64_ooo.v`** -- the actual FPGA
+  target module -- threads `USE_AXI_MEM` into both `riscv64_ooo_proc`
+  instances and into `l2_cache`, exposing all 4 threads' instruction-
+  memory write ports (`c0t0`/`c0t1`/`c1t0`/`c1t1`) plus the one shared
+  `dmem_axi_wr_*` port for L2's backing memory at its own top level.
+- **Verified with `tb_instruction_fetch_axi.v`**: AXI-writes 4 halfwords
+  (two instructions' worth) directly, then confirms fetching at both
+  pc=0 and pc=4 returns the correctly halfword-paired, genuinely
+  AXI-loaded content.
+- **Zero regressions**: the full pre-existing suite, including the
+  dual-core and lockstep tests (which instantiate `riscv64_ooo_proc.v`/
+  `dual_core_riscv64_ooo.v` directly), passes with identical cycle counts.
+- **Not done yet**: the AXI-lite control/status register block, the
+  top-level FPGA wrapper tying the AXI-lite peripherals to
+  `dual_core_riscv64_ooo.v`'s new ports, the Vivado block-design/TCL
+  work, and the PYNQ Python driver.

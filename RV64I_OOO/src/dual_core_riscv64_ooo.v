@@ -31,7 +31,12 @@ module dual_core_riscv64_ooo #(
     parameter L1_LINES = 16,
     parameter L1_LINE_BYTES = 32,
     parameter SBUF_DEPTH = 4,
-    parameter L2_LINES = 64
+    parameter L2_LINES = 64,
+    // Phase 12 (FPGA bring-up): 0 (default, every existing testbench)
+    // keeps every instruction/backing memory on its $readmemh path; 1
+    // selects the AXI-writable variants everywhere -- see
+    // instruction_fetch_reg.v's and l2_cache.v's own USE_AXI_MEM.
+    parameter USE_AXI_MEM = 0
 )(
     input clk,
     input reset,
@@ -39,7 +44,17 @@ module dual_core_riscv64_ooo #(
     output wire [63:0] c0t0_pc_out, output wire [63:0] c0t1_pc_out,
     output wire c0t0_ecall_halt, output wire c0t1_ecall_halt,
     output wire [63:0] c1t0_pc_out, output wire [63:0] c1t1_pc_out,
-    output wire c1t0_ecall_halt, output wire c1t1_ecall_halt
+    output wire c1t0_ecall_halt, output wire c1t1_ecall_halt,
+
+    // Phase 12 (FPGA bring-up): only meaningful when USE_AXI_MEM=1. One
+    // write port per thread's instruction memory (mirrored internally to
+    // both of that thread's fetch instances -- see riscv64_ooo_proc.v's
+    // own header), plus one for the single shared L2 backing memory.
+    input c0t0_imem_axi_wr_en, input [$clog2(IMEM_WORDS)-1:0] c0t0_imem_axi_wr_addr, input [15:0] c0t0_imem_axi_wr_data,
+    input c0t1_imem_axi_wr_en, input [$clog2(IMEM_WORDS)-1:0] c0t1_imem_axi_wr_addr, input [15:0] c0t1_imem_axi_wr_data,
+    input c1t0_imem_axi_wr_en, input [$clog2(IMEM_WORDS)-1:0] c1t0_imem_axi_wr_addr, input [15:0] c1t0_imem_axi_wr_data,
+    input c1t1_imem_axi_wr_en, input [$clog2(IMEM_WORDS)-1:0] c1t1_imem_axi_wr_addr, input [15:0] c1t1_imem_axi_wr_data,
+    input dmem_axi_wr_en, input [$clog2(DMEM_WORDS)-1:0] dmem_axi_wr_addr, input [63:0] dmem_axi_wr_data
 );
     localparam VBITS = L1_LINE_BYTES * 8;
 
@@ -54,7 +69,7 @@ module dual_core_riscv64_ooo #(
         .ROB_DEPTH(ROB_DEPTH), .ALU_RS_DEPTH(ALU_RS_DEPTH), .MUL_RS_DEPTH(MUL_RS_DEPTH),
         .LSQ_DEPTH(LSQ_DEPTH), .ENABLE_DUAL_ISSUE(ENABLE_DUAL_ISSUE), .LANES(LANES),
         .VEC_RS_DEPTH(VEC_RS_DEPTH), .L1_LINES(L1_LINES), .L1_LINE_BYTES(L1_LINE_BYTES),
-        .SBUF_DEPTH(SBUF_DEPTH)
+        .SBUF_DEPTH(SBUF_DEPTH), .USE_AXI_MEM(USE_AXI_MEM)
     ) core0 (
         .clk(clk), .reset(reset),
         .pc_out0(c0t0_pc_out), .pc_out1(c0t1_pc_out),
@@ -63,7 +78,11 @@ module dual_core_riscv64_ooo #(
         .l2_req_wb_data(c0_l2_req_wb_data),
         .l2_resp_valid(c0_l2_resp_valid), .l2_resp_data(c0_l2_resp_data), .l2_resp_exclusive(c0_l2_resp_exclusive),
         .snoop_req_valid(c0_snoop_req_valid), .snoop_req_type(c0_snoop_req_type), .snoop_req_addr(c0_snoop_req_addr),
-        .snoop_resp_hit(c0_snoop_resp_hit), .snoop_resp_dirty(c0_snoop_resp_dirty), .snoop_resp_data(c0_snoop_resp_data)
+        .snoop_resp_hit(c0_snoop_resp_hit), .snoop_resp_dirty(c0_snoop_resp_dirty), .snoop_resp_data(c0_snoop_resp_data),
+        .ecc_rf_sbe_fault(), .ecc_rf_dbe_fault(), .ecc_l1_sbe_fault(), .ecc_l1_dbe_fault(),
+        .ecc_rob_sbe_fault(), .ecc_rob_dbe_fault(),
+        .t0_imem_axi_wr_en(c0t0_imem_axi_wr_en), .t0_imem_axi_wr_addr(c0t0_imem_axi_wr_addr), .t0_imem_axi_wr_data(c0t0_imem_axi_wr_data),
+        .t1_imem_axi_wr_en(c0t1_imem_axi_wr_en), .t1_imem_axi_wr_addr(c0t1_imem_axi_wr_addr), .t1_imem_axi_wr_data(c0t1_imem_axi_wr_data)
     );
 
     wire c1_l2_req_valid; wire [1:0] c1_l2_req_type; wire [63:0] c1_l2_req_addr;
@@ -77,7 +96,7 @@ module dual_core_riscv64_ooo #(
         .ROB_DEPTH(ROB_DEPTH), .ALU_RS_DEPTH(ALU_RS_DEPTH), .MUL_RS_DEPTH(MUL_RS_DEPTH),
         .LSQ_DEPTH(LSQ_DEPTH), .ENABLE_DUAL_ISSUE(ENABLE_DUAL_ISSUE), .LANES(LANES),
         .VEC_RS_DEPTH(VEC_RS_DEPTH), .L1_LINES(L1_LINES), .L1_LINE_BYTES(L1_LINE_BYTES),
-        .SBUF_DEPTH(SBUF_DEPTH)
+        .SBUF_DEPTH(SBUF_DEPTH), .USE_AXI_MEM(USE_AXI_MEM)
     ) core1 (
         .clk(clk), .reset(reset),
         .pc_out0(c1t0_pc_out), .pc_out1(c1t1_pc_out),
@@ -86,11 +105,15 @@ module dual_core_riscv64_ooo #(
         .l2_req_wb_data(c1_l2_req_wb_data),
         .l2_resp_valid(c1_l2_resp_valid), .l2_resp_data(c1_l2_resp_data), .l2_resp_exclusive(c1_l2_resp_exclusive),
         .snoop_req_valid(c1_snoop_req_valid), .snoop_req_type(c1_snoop_req_type), .snoop_req_addr(c1_snoop_req_addr),
-        .snoop_resp_hit(c1_snoop_resp_hit), .snoop_resp_dirty(c1_snoop_resp_dirty), .snoop_resp_data(c1_snoop_resp_data)
+        .snoop_resp_hit(c1_snoop_resp_hit), .snoop_resp_dirty(c1_snoop_resp_dirty), .snoop_resp_data(c1_snoop_resp_data),
+        .ecc_rf_sbe_fault(), .ecc_rf_dbe_fault(), .ecc_l1_sbe_fault(), .ecc_l1_dbe_fault(),
+        .ecc_rob_sbe_fault(), .ecc_rob_dbe_fault(),
+        .t0_imem_axi_wr_en(c1t0_imem_axi_wr_en), .t0_imem_axi_wr_addr(c1t0_imem_axi_wr_addr), .t0_imem_axi_wr_data(c1t0_imem_axi_wr_data),
+        .t1_imem_axi_wr_en(c1t1_imem_axi_wr_en), .t1_imem_axi_wr_addr(c1t1_imem_axi_wr_addr), .t1_imem_axi_wr_data(c1t1_imem_axi_wr_data)
     );
 
     l2_cache #(.L2_LINES(L2_LINES), .LINE_BYTES(L1_LINE_BYTES), .ADDR_BITS(64),
-               .DMEM_FILE(DMEM_FILE), .DMEM_WORDS(DMEM_WORDS)) l2 (
+               .DMEM_FILE(DMEM_FILE), .DMEM_WORDS(DMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) l2 (
         .clk(clk), .reset(reset),
         .c0_req_valid(c0_l2_req_valid), .c0_req_type(c0_l2_req_type), .c0_req_addr(c0_l2_req_addr),
         .c0_req_wb_data(c0_l2_req_wb_data),
@@ -101,6 +124,8 @@ module dual_core_riscv64_ooo #(
         .snoop0_req_valid(c0_snoop_req_valid), .snoop0_req_type(c0_snoop_req_type), .snoop0_req_addr(c0_snoop_req_addr),
         .snoop0_resp_hit(c0_snoop_resp_hit), .snoop0_resp_dirty(c0_snoop_resp_dirty), .snoop0_resp_data(c0_snoop_resp_data),
         .snoop1_req_valid(c1_snoop_req_valid), .snoop1_req_type(c1_snoop_req_type), .snoop1_req_addr(c1_snoop_req_addr),
-        .snoop1_resp_hit(c1_snoop_resp_hit), .snoop1_resp_dirty(c1_snoop_resp_dirty), .snoop1_resp_data(c1_snoop_resp_data)
+        .snoop1_resp_hit(c1_snoop_resp_hit), .snoop1_resp_dirty(c1_snoop_resp_dirty), .snoop1_resp_data(c1_snoop_resp_data),
+        .ecc_l2_sbe_fault(), .ecc_l2_dbe_fault(),
+        .axi_wr_en(dmem_axi_wr_en), .axi_wr_addr(dmem_axi_wr_addr), .axi_wr_data(dmem_axi_wr_data)
     );
 endmodule

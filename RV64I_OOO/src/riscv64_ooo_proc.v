@@ -206,7 +206,14 @@ module riscv64_ooo_proc #(
     // a single core no longer owns (or even can reach) memory directly.
     parameter L1_LINES = 16,
     parameter L1_LINE_BYTES = 32,
-    parameter SBUF_DEPTH = 4
+    parameter SBUF_DEPTH = 4,
+    // Phase 12 (FPGA bring-up): 0 (default, every existing testbench)
+    // keeps every instruction_fetch_reg instance on its $readmemh path;
+    // 1 selects instruction_fetch_axi.v instead (see that module's own
+    // header). The imem_axi_wr_* ports below are only ever wired to
+    // anything when this is 1, so -- like l2_cache.v's own USE_AXI_MEM --
+    // no pre-existing testbench needs updating.
+    parameter USE_AXI_MEM = 0
     // BRANCH_RS and DIV_RS are fixed at exactly 1 entry per thread -- see
     // their headers for why that's not a knob worth exposing. NUM_THREADS
     // is likewise fixed at exactly 2 -- see module header for the scope
@@ -248,7 +255,19 @@ module riscv64_ooo_proc #(
     output wire ecc_l1_dbe_fault,
     // Phase 9 (ECC): OR'd across both threads' ROBs -- see rob.v.
     output wire ecc_rob_sbe_fault,
-    output wire ecc_rob_dbe_fault
+    output wire ecc_rob_dbe_fault,
+
+    // Phase 12 (FPGA bring-up): only meaningful when USE_AXI_MEM=1.
+    // Each thread's if0/if1 are two independent physical memory copies
+    // of the same content (see module header) -- mirrored to both
+    // inside this module, so the caller only needs to drive one write
+    // per thread, not one per fetch instance.
+    input t0_imem_axi_wr_en,
+    input [$clog2(IMEM_WORDS)-1:0] t0_imem_axi_wr_addr,
+    input [15:0] t0_imem_axi_wr_data,
+    input t1_imem_axi_wr_en,
+    input [$clog2(IMEM_WORDS)-1:0] t1_imem_axi_wr_addr,
+    input [15:0] t1_imem_axi_wr_data
 );
     localparam TB = $clog2(ROB_DEPTH);
     localparam VLEN = LANES * 32;
@@ -287,11 +306,13 @@ module riscv64_ooo_proc #(
     end
 
     program_counter t0_pc_module (.clk(clk), .reset(reset), .pc_in(t0_next_pc), .pc_out(t0_pc));
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS)) t0_if0 (
-        .clk(clk), .pc(t0_pc), .instruction(t0_instruction0)
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t0_if0 (
+        .clk(clk), .pc(t0_pc), .instruction(t0_instruction0),
+        .axi_wr_en(t0_imem_axi_wr_en), .axi_wr_addr(t0_imem_axi_wr_addr), .axi_wr_data(t0_imem_axi_wr_data)
     );
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS)) t0_if1 (
-        .clk(clk), .pc(t0_pc1), .instruction(t0_instruction1)
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t0_if1 (
+        .clk(clk), .pc(t0_pc1), .instruction(t0_instruction1),
+        .axi_wr_en(t0_imem_axi_wr_en), .axi_wr_addr(t0_imem_axi_wr_addr), .axi_wr_data(t0_imem_axi_wr_data)
     );
     assign pc_out0 = t0_pc_latched;
 
@@ -362,11 +383,13 @@ module riscv64_ooo_proc #(
     end
 
     program_counter t1_pc_module (.clk(clk), .reset(reset), .pc_in(t1_next_pc), .pc_out(t1_pc));
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS)) t1_if0 (
-        .clk(clk), .pc(t1_pc), .instruction(t1_instruction0)
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t1_if0 (
+        .clk(clk), .pc(t1_pc), .instruction(t1_instruction0),
+        .axi_wr_en(t1_imem_axi_wr_en), .axi_wr_addr(t1_imem_axi_wr_addr), .axi_wr_data(t1_imem_axi_wr_data)
     );
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS)) t1_if1 (
-        .clk(clk), .pc(t1_pc1), .instruction(t1_instruction1)
+    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t1_if1 (
+        .clk(clk), .pc(t1_pc1), .instruction(t1_instruction1),
+        .axi_wr_en(t1_imem_axi_wr_en), .axi_wr_addr(t1_imem_axi_wr_addr), .axi_wr_data(t1_imem_axi_wr_data)
     );
     assign pc_out1 = t1_pc_latched;
 
