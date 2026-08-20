@@ -12,14 +12,15 @@ RV64IMACFD+RVV feature set.
 
 ## Status
 
-**Phases 1 through 11 are all complete: 33/33 single-core full-pipeline
+**Phases 1 through 12 are all complete: 33/33 single-core full-pipeline
 tests pass, plus a dedicated 2-core coherency test**, plus 21/21 isolated
 ROB+RAT unit-test checks, 15/15 standalone divider unit tests, 13/13
 isolated L1/L2 MESI coherency checks, 2/2 lockstep DMR checks, 6/6
 isolated ECC checks, and 3/3 isolated Phase 10 memory-optimization
 checks (prefetch, hit-under-miss, merging write buffer) — all still
-passing, unchanged, after Phase 11's fetch-latency retiming for real
-FPGA timing (see below).
+passing, unchanged, after Phase 11's fetch-latency retiming and Phase
+12's AXI-loadable backing memory, both for real FPGA bring-up (see
+below), plus 3 new isolated Phase 12 checks of its own.
 
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
@@ -1503,3 +1504,80 @@ first, on its own, before any board-specific work.
   verified in simulation only. No synthesis, timing closure, or
   resource-utilization numbers exist yet for this design on real
   hardware.
+
+## Phase 12: FPGA bring-up — AXI-loadable backing memory
+
+Direct continuation of Phase 11: the user chose to build a real AXI-
+loadable memory (the PS side writes a program without re-synthesizing)
+rather than keep `$readmemh`-baked content for the FPGA target. Scoped
+to the L2/data-memory side first, since it surfaced its own prerequisite
+along the way: `l2_cache.v`'s `ST_MEM_WAIT` state still assumed the
+backing memory's read was combinational (the same assumption Phase 11
+already had to remove from the fetch side), so it needed the identical
+"registered read" treatment before an AXI-loadable variant could exist
+at all.
+
+- **`data_memory_axi.v`** (new): a registered-read, AXI-writable
+  reimplementation of `data_memory.v`'s RVV vector port only -- the one
+  interface `l2_cache.v`'s backing-memory instance actually uses (its
+  scalar port has always been tied off). Not a wrapper around
+  `data_memory.v` (unlike `instruction_fetch_reg.v`): that module's read
+  is combinational and shared with a tied-off scalar port on the same
+  array, so a clean, registered, vector-port-only reimplementation was
+  simplest as its own small file. A `LOAD_FROM_FILE` parameter (default
+  1, matching every simulation use) makes `$readmemh` fully optional --
+  the real hardware build sets it to 0 so synthesis never attempts to
+  read a file that doesn't exist at that point; content instead arrives
+  entirely through a new `axi_wr_en`/`axi_wr_addr`/`axi_wr_data` write
+  port, independent of (and, by construction of how the system is
+  driven -- AXI loads only while the core sits in reset -- never
+  arbitrated against) the core's own `vmem_write` path.
+- **`l2_cache.v`'s `ST_MEM_WAIT` split into `ST_MEM_WAIT`/`ST_MEM_WAIT2`**:
+  the state that used to consume `mem_vrdata` the same cycle it asserted
+  `mem_vread` now waits one additional cycle before consuming it. This is
+  a strict superset of correctness, not a variant behavior: it still
+  works identically with the original, still-combinational
+  `data_memory.v` used everywhere in simulation (the value is already
+  sitting there stably by the second cycle either way, just consumed one
+  harmless cycle later than the tightest possible bound), and it's what
+  makes `l2_cache.v` correct for a genuinely registered backing memory
+  without needing two divergent copies of the FSM.
+- **`l2_cache.v`'s new `USE_AXI_MEM` parameter** (default 0) selects,
+  via a `generate if`, between instantiating the original `data_memory.v`
+  (every existing testbench) or `data_memory_axi.v` (the real hardware
+  target). The corresponding `axi_wr_*` ports needed no tie-off updates
+  across any pre-existing testbench: unlike Phase 10's `cpu_read2_*`
+  (consumed unconditionally by always-active combinational logic, so an
+  unconnected input's X could reach a real output), these ports are only
+  ever wired to anything inside the `USE_AXI_MEM=1` generate branch --
+  with `USE_AXI_MEM=0`, there is no logic path for them to reach at all,
+  so leaving them unconnected is completely inert.
+- **Verified with 2 new isolated tests**: `tb_data_memory_axi.v` (AXI
+  write -> vector-port read, plus confirming the core's own `vmem_write`
+  path still works independently) and `tb_l2_axi_load.v` (the real,
+  intended use case end to end -- AXI-preload one full cache line
+  directly into `data_memory_axi.v`, standing in for the PS writing a
+  program image before the core ever runs, then drive a genuine
+  `l1_cache.v` read miss through `l2_cache.v` with `USE_AXI_MEM=1` and
+  confirm the AXI-loaded content, not a `$readmemh` or hand-poked value,
+  comes back correctly -- both the missed word and a second, same-line
+  word served as a clean L1 hit afterward). `tb_l2_axi_load.v`'s first
+  draft found a real testbench bug, not an RTL one: a plain one-cycle
+  `cpu_read_req` pulse can be silently missed if `l1_cache.v`'s own Phase
+  10 autonomous prefetcher happens to grab the FSM on an idle cycle right
+  before the pulse arrives, and since a prefetch fill still touches
+  `read_data_r` as an (invisible-to-real-callers, since they always gate
+  on `cpu_read_valid`) side effect of its own, the test read back a
+  prefetch's stale/uninitialized content instead of its own request's.
+  Fixed by holding the request asserted until its own `cpu_read_valid`
+  actually pulses -- the same pattern a real caller (`lsq.v`) already
+  uses -- rather than trusting `busy` alone.
+- **Zero regressions**: the full pre-existing suite -- 33/33 single-core,
+  the dual-core coherency test, both lockstep checks, and all 6
+  benchmarks -- passes unchanged.
+- **Not done yet**: the instruction-memory side of AXI loading (with its
+  own wrinkle -- each thread's 2-wide fetch uses two independent physical
+  memory copies of the same content, per `riscv64_ooo_proc.v`'s existing
+  `t0_if0`/`t0_if1` design, so AXI writes need to be mirrored to both),
+  the AXI-lite control/status register block, the top-level FPGA wrapper,
+  and all Vivado/PYNQ-side work.

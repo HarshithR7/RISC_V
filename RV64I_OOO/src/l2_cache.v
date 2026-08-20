@@ -40,7 +40,18 @@ module l2_cache #(
     parameter LINE_BYTES = 32,
     parameter ADDR_BITS = 64,
     parameter DMEM_FILE = "data.mem",
-    parameter DMEM_WORDS = 4096
+    parameter DMEM_WORDS = 4096,
+    // Phase 12 (FPGA bring-up): 0 (default, every existing testbench)
+    // instantiates the original data_memory.v unchanged; 1 selects
+    // data_memory_axi.v instead (registered read + a PS-side AXI write
+    // port for program/data loading -- see that file's own header). The
+    // axi_wr_* ports below are only ever consumed inside the USE_AXI_MEM
+    // branch of the generate block below, so leaving them unconnected in
+    // every pre-existing USE_AXI_MEM=0 instantiation is completely inert
+    // -- there is no logic path for an unconnected input to reach,
+    // unlike a port consumed unconditionally (contrast Phase 10's
+    // cpu_read2_*, which needed every existing testbench updated).
+    parameter USE_AXI_MEM = 0
 )(
     input clk,
     input reset,
@@ -95,7 +106,13 @@ module l2_cache #(
     // not the directory (l2_valid/l2_tag/presence0/presence1) -- same
     // "bulk data, not small control metadata" scope as l1_cache.v.
     output ecc_l2_sbe_fault,
-    output ecc_l2_dbe_fault
+    output ecc_l2_dbe_fault,
+
+    // Phase 12 (FPGA bring-up): only meaningful when USE_AXI_MEM=1 --
+    // see this module's parameter list and data_memory_axi.v's header.
+    input axi_wr_en,
+    input [$clog2(DMEM_WORDS)-1:0] axi_wr_addr,
+    input [63:0] axi_wr_data
 );
     localparam OFF_BITS = $clog2(LINE_BYTES);
     localparam IDX_BITS = $clog2(L2_LINES);
@@ -125,17 +142,35 @@ module l2_cache #(
     end
 
     // ---- Backing memory (whole-line access via the reused vmem port) ----
+    // Phase 12 (FPGA bring-up): USE_AXI_MEM selects between the original
+    // data_memory.v (combinational read, $readmemh-loaded -- every
+    // existing simulation target) and data_memory_axi.v (registered
+    // read, AXI-writable -- the real hardware target). l2_cache.v's own
+    // FSM (ST_MEM_WAIT/ST_MEM_WAIT2) already tolerates whichever one is
+    // selected; see that FSM's own comment.
     reg mem_vread, mem_vwrite;
     reg [ADDR_BITS-1:0] mem_vaddr;
     reg [VLEN-1:0] mem_vwdata;
     wire [VLEN-1:0] mem_vrdata;
-    data_memory #(.DMEM_FILE(DMEM_FILE), .DMEM_WORDS(DMEM_WORDS), .VLEN(VLEN)) backing_mem (
-        .clk(clk),
-        .mem_read(1'b0), .mem_write(1'b0), .func3(3'b011), .mem_addr(64'b0), .write_data(64'b0),
-        .read_data(),
-        .vmem_read(mem_vread), .vmem_write(mem_vwrite), .vmem_addr(mem_vaddr),
-        .vmem_write_data(mem_vwdata), .vmem_read_data(mem_vrdata)
-    );
+    generate
+        if (USE_AXI_MEM) begin : axi_backing
+            data_memory_axi #(.DMEM_FILE(DMEM_FILE), .DMEM_WORDS(DMEM_WORDS), .VLEN(VLEN),
+                               .LOAD_FROM_FILE(0)) backing_mem (
+                .clk(clk),
+                .vmem_read(mem_vread), .vmem_write(mem_vwrite), .vmem_addr(mem_vaddr),
+                .vmem_write_data(mem_vwdata), .vmem_read_data(mem_vrdata),
+                .axi_wr_en(axi_wr_en), .axi_wr_addr(axi_wr_addr), .axi_wr_data(axi_wr_data)
+            );
+        end else begin : sim_backing
+            data_memory #(.DMEM_FILE(DMEM_FILE), .DMEM_WORDS(DMEM_WORDS), .VLEN(VLEN)) backing_mem (
+                .clk(clk),
+                .mem_read(1'b0), .mem_write(1'b0), .func3(3'b011), .mem_addr(64'b0), .write_data(64'b0),
+                .read_data(),
+                .vmem_read(mem_vread), .vmem_write(mem_vwrite), .vmem_addr(mem_vaddr),
+                .vmem_write_data(mem_vwdata), .vmem_read_data(mem_vrdata)
+            );
+        end
+    endgenerate
 
     function [IDX_BITS-1:0] idx_of; input [ADDR_BITS-1:0] a; begin idx_of = a[IDX_BITS+OFF_BITS-1:OFF_BITS]; end endfunction
     function [TAG_BITS-1:0] tag_of; input [ADDR_BITS-1:0] a; begin tag_of = a[ADDR_BITS-1:IDX_BITS+OFF_BITS]; end endfunction
@@ -148,10 +183,11 @@ module l2_cache #(
                ST_EVICT_MEMWR = 2,  // flush recovered dirty data from the forced invalidate
                ST_MEM_FETCH   = 3,  // L2 miss: pull the new line in from memory
                ST_MEM_WAIT    = 4,
+               ST_MEM_WAIT2   = 8,  // Phase 12: see its own comment below
                ST_SNOOP_OTHER = 5,  // normal coherence snoop of the non-requesting core
                ST_RESPOND     = 6,
                ST_COOLDOWN    = 7;  // see its own comment below
-    reg [2:0] fsm;
+    reg [3:0] fsm;
     reg req_core;                    // 0 or 1: which core this transaction serves
     reg [1:0] req_type_r;
     reg [ADDR_BITS-1:0] req_addr_r;
@@ -216,7 +252,7 @@ module l2_cache #(
     // l2_write_value never depends on l2_line_corrected; it's a plain
     // FSM-state mux over the 3 fresh incoming values.
     wire [LINE_BYTES*8-1:0] l2_write_value =
-        (fsm == ST_MEM_WAIT)    ? mem_vrdata :
+        (fsm == ST_MEM_WAIT2)   ? mem_vrdata :
         (fsm == ST_SNOOP_OTHER) ? normal_other_data :
                                    req_wbdata_r; // ST_EVICT_SNOOP (REQ_WB)
     wire [LINE_BYTES-1:0] l2_write_check;
@@ -321,13 +357,31 @@ module l2_cache #(
                     end
                 end
 
+                // Phase 12 (FPGA bring-up: registered backing memory):
+                // this used to consume mem_vrdata in THIS state, back
+                // when data_memory.v's vector read port was purely
+                // combinational (valid the same cycle vmem_read is
+                // asserted). A real hardware backing memory (Block RAM,
+                // needed at this design's capacity -- see
+                // instruction_fetch_reg.v's own header for the identical
+                // reasoning on the fetch side) has no combinational-read
+                // mode, so mem_vrdata is only valid ONE cycle after
+                // mem_vread is asserted, not the same cycle. This state
+                // is now just that one cycle of wait -- mem_vread was
+                // asserted via NBA during ST_MEM_FETCH, so it's visible
+                // starting THIS state's cycle, and a registered memory's
+                // result becomes valid starting the NEXT cycle
+                // (ST_MEM_WAIT2). This is a strict superset of
+                // correctness: it also still works with the unmodified,
+                // still-combinational data_memory.v used everywhere in
+                // simulation -- mem_vrdata is already stably sitting
+                // there by ST_MEM_WAIT2 either way, just consumed one
+                // (harmless) cycle later than the tightest possible bound.
                 ST_MEM_WAIT: begin
-                    // data_memory.v's vector read port is combinational
-                    // (valid the same cycle vmem_read is asserted -- see
-                    // its own header), so mem_vrdata is already settled by
-                    // the time this state is reached; one cycle here just
-                    // matches the read-request/consume-result convention
-                    // used throughout this pair of modules.
+                    fsm <= ST_MEM_WAIT2;
+                end
+
+                ST_MEM_WAIT2: begin
                     l2_valid[req_idx] <= 1'b1;
                     l2_tag[req_idx]   <= req_tag;
                     l2_data[req_idx]  <= l2_write_value;
