@@ -92,7 +92,14 @@ module tb_cache_mesi;
         .snoop0_req_valid(snoop0_req_valid), .snoop0_req_type(snoop0_req_type), .snoop0_req_addr(snoop0_req_addr),
         .snoop0_resp_hit(snoop0_resp_hit), .snoop0_resp_dirty(snoop0_resp_dirty), .snoop0_resp_data(snoop0_resp_data),
         .snoop1_req_valid(snoop1_req_valid), .snoop1_req_type(snoop1_req_type), .snoop1_req_addr(snoop1_req_addr),
-        .snoop1_resp_hit(snoop1_resp_hit), .snoop1_resp_dirty(snoop1_resp_dirty), .snoop1_resp_data(snoop1_resp_data)
+        .snoop1_resp_hit(snoop1_resp_hit), .snoop1_resp_dirty(snoop1_resp_dirty), .snoop1_resp_data(snoop1_resp_data),
+        // Phase 15: 3rd (GPU) coherent port, unused by this 2-agent test --
+        // tied off explicitly rather than left floating; see
+        // tb_l2_three_way.v for the dedicated 3-agent test.
+        .gpu_req_valid(1'b0), .gpu_req_type(2'b0), .gpu_req_addr(64'b0), .gpu_req_wb_data({VLEN{1'b0}}),
+        .gpu_resp_valid(), .gpu_resp_data(), .gpu_resp_exclusive(),
+        .snoop_gpu_req_valid(), .snoop_gpu_req_type(), .snoop_gpu_req_addr(),
+        .snoop_gpu_resp_hit(1'b0), .snoop_gpu_resp_dirty(1'b0), .snoop_gpu_resp_data({VLEN{1'b0}})
     );
 
     integer checks = 0, failures = 0;

@@ -126,6 +126,20 @@ module dual_core_riscv64_ooo #(
         .snoop0_resp_hit(c0_snoop_resp_hit), .snoop0_resp_dirty(c0_snoop_resp_dirty), .snoop0_resp_data(c0_snoop_resp_data),
         .snoop1_req_valid(c1_snoop_req_valid), .snoop1_req_type(c1_snoop_req_type), .snoop1_req_addr(c1_snoop_req_addr),
         .snoop1_resp_hit(c1_snoop_resp_hit), .snoop1_resp_dirty(c1_snoop_resp_dirty), .snoop1_resp_data(c1_snoop_resp_data),
+        // Phase 15: l2_cache.v's 3rd (GPU/accelerator) coherent port tied
+        // off -- no 3rd agent attached in this 2-core module, so its
+        // request is permanently deasserted and its snoop response
+        // permanently "no hit," exactly like an always-idle L1 would
+        // report. Keeps every existing dual-core instantiation's behavior
+        // byte-for-byte identical to before this port existed; a real 3rd
+        // agent (see tb_l2_three_way.v) would replace these ties with its
+        // own req/resp and snoop wires instead.
+        .gpu_req_valid(1'b0), .gpu_req_type(2'b0), .gpu_req_addr(64'b0),
+        .gpu_req_wb_data({(L1_LINE_BYTES*8){1'b0}}),
+        .gpu_resp_valid(), .gpu_resp_data(), .gpu_resp_exclusive(),
+        .snoop_gpu_req_valid(), .snoop_gpu_req_type(), .snoop_gpu_req_addr(),
+        .snoop_gpu_resp_hit(1'b0), .snoop_gpu_resp_dirty(1'b0),
+        .snoop_gpu_resp_data({(L1_LINE_BYTES*8){1'b0}}),
         .ecc_l2_sbe_fault(), .ecc_l2_dbe_fault(),
         .axi_wr_en(dmem_axi_wr_en), .axi_wr_addr(dmem_axi_wr_addr), .axi_wr_data(dmem_axi_wr_data)
     );

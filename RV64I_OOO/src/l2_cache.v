@@ -102,9 +102,35 @@ module l2_cache #(
     input snoop1_resp_dirty,
     input [LINE_BYTES*8-1:0] snoop1_resp_data,
 
+    // ---- Phase 15: a 3rd coherent requester port, identical in shape to
+    // core 0's/core 1's above -- this is the actual interconnect fabric a
+    // GPU-class accelerator (or any other coherent agent) attaches to.
+    // Deliberately the exact same req/resp + snoop protocol l1_cache.v
+    // already speaks -- dual_core_riscv64_ooo.v ties this port off
+    // (gpu_req_valid tied to 0) to keep every existing 2-agent instantiation
+    // byte-for-byte unchanged; tb_l2_three_way.v wires a real l1_cache.v
+    // instance onto it to prove genuine 3-way MESI transitions (a
+    // coherent agent's own cache hierarchy would replace that l1_cache.v
+    // stand-in in a real integration -- no GPU compute core is implied or
+    // needed here, only the fabric it would attach to).
+    input gpu_req_valid,
+    input [1:0] gpu_req_type,
+    input [ADDR_BITS-1:0] gpu_req_addr,
+    input [LINE_BYTES*8-1:0] gpu_req_wb_data,
+    output reg gpu_resp_valid,
+    output reg [LINE_BYTES*8-1:0] gpu_resp_data,
+    output reg gpu_resp_exclusive,
+
+    output wire snoop_gpu_req_valid,
+    output wire [1:0] snoop_gpu_req_type,
+    output wire [ADDR_BITS-1:0] snoop_gpu_req_addr,
+    input snoop_gpu_resp_hit,
+    input snoop_gpu_resp_dirty,
+    input [LINE_BYTES*8-1:0] snoop_gpu_resp_data,
+
     // Phase 9 (ECC): protects only l2_data[] (see the ECC section below),
-    // not the directory (l2_valid/l2_tag/presence0/presence1) -- same
-    // "bulk data, not small control metadata" scope as l1_cache.v.
+    // not the directory (l2_valid/l2_tag/presence0/presence1/presence_gpu)
+    // -- same "bulk data, not small control metadata" scope as l1_cache.v.
     output ecc_l2_sbe_fault,
     output ecc_l2_dbe_fault,
 
@@ -130,6 +156,7 @@ module l2_cache #(
     reg [LINE_BYTES-1:0] l2_check [0:L2_LINES-1];
     reg presence0 [0:L2_LINES-1];
     reg presence1 [0:L2_LINES-1];
+    reg presence_gpu [0:L2_LINES-1];
 
     integer li;
     initial begin
@@ -138,6 +165,7 @@ module l2_cache #(
             l2_check[li] = {LINE_BYTES{1'b0}};
             presence0[li] = 1'b0;
             presence1[li] = 1'b0;
+            presence_gpu[li] = 1'b0;
         end
     end
 
@@ -187,8 +215,12 @@ module l2_cache #(
                ST_SNOOP_OTHER = 5,  // normal coherence snoop of the non-requesting core
                ST_RESPOND     = 6,
                ST_COOLDOWN    = 7;  // see its own comment below
+    // Phase 15: widened 0/1 -> a 2-bit agent id (AG_C0/AG_C1/AG_GPU) to
+    // name a 3rd requester -- see this module's header for the fixed-
+    // priority arbitration convention (unchanged, just extended by one).
+    localparam AG_C0 = 2'd0, AG_C1 = 2'd1, AG_GPU = 2'd2;
     reg [3:0] fsm;
-    reg req_core;                    // 0 or 1: which core this transaction serves
+    reg [1:0] req_core;               // which agent this transaction serves
     reg [1:0] req_type_r;
     reg [ADDR_BITS-1:0] req_addr_r;
     reg [LINE_BYTES*8-1:0] req_wbdata_r;
@@ -199,16 +231,23 @@ module l2_cache #(
     wire [IDX_BITS-1:0] req_idx = idx_of(req_addr_r);
     wire [TAG_BITS-1:0] req_tag = tag_of(req_addr_r);
     wire l2_hit = l2_valid[req_idx] && (l2_tag[req_idx] == req_tag);
-    wire other_presence = req_core ? presence0[req_idx] : presence1[req_idx];
 
     // ---- Combinational snoop assertion -- see the port comment above --
+    // Phase 15: with a 3rd agent, "the other one(s)" is no longer a plain
+    // NOT of the requester -- each agent's own want signal now checks its
+    // own identity-vs-requester AND its own presence bit directly, so
+    // zero, one, or (for the eviction case) both non-requesting agents
+    // can be snooped the same cycle exactly as the original 2-agent code
+    // already did for the single non-requester case.
     wire evict_needed = (fsm == ST_EVICT_SNOOP) && (req_type_r != REQ_WB) &&
                          l2_valid[req_idx] && (l2_tag[req_idx] != req_tag);
-    wire evict_want0 = evict_needed && presence0[req_idx];
-    wire evict_want1 = evict_needed && presence1[req_idx];
-    wire normal_snoop = (fsm == ST_SNOOP_OTHER) && other_presence;
-    wire normal_want0 = normal_snoop && req_core;   // requester is core1 -> snoop core0
-    wire normal_want1 = normal_snoop && !req_core;  // requester is core0 -> snoop core1
+    wire evict_want0   = evict_needed && presence0[req_idx];
+    wire evict_want1   = evict_needed && presence1[req_idx];
+    wire evict_want_gpu = evict_needed && presence_gpu[req_idx];
+    wire normal_snoop = (fsm == ST_SNOOP_OTHER);
+    wire normal_want0   = normal_snoop && (req_core != AG_C0)  && presence0[req_idx];
+    wire normal_want1   = normal_snoop && (req_core != AG_C1)  && presence1[req_idx];
+    wire normal_want_gpu = normal_snoop && (req_core != AG_GPU) && presence_gpu[req_idx];
     wire [1:0] normal_type = (req_type_r == REQ_BUSRD) ? REQ_BUSRD : REQ_BUSRDX;
 
     assign snoop0_req_valid = evict_want0 || normal_want0;
@@ -219,12 +258,30 @@ module l2_cache #(
     assign snoop1_req_type  = evict_want1 ? REQ_BUSRDX : normal_type;
     assign snoop1_req_addr  = evict_want1 ? line_addr_of(l2_tag[req_idx], req_idx) : req_addr_r;
 
+    assign snoop_gpu_req_valid = evict_want_gpu || normal_want_gpu;
+    assign snoop_gpu_req_type  = evict_want_gpu ? REQ_BUSRDX : normal_type;
+    assign snoop_gpu_req_addr  = evict_want_gpu ? line_addr_of(l2_tag[req_idx], req_idx) : req_addr_r;
+
+    // MESI guarantees at most one of (up to 2) non-requesting agents can
+    // ever hold a line dirty (M) at once, so a plain OR/priority-mux
+    // across the up-to-3 want flags is always unambiguous -- exactly the
+    // same reasoning the original 2-agent ternary relied on, just written
+    // as an explicit chain now that there can be 2 non-requester agents
+    // instead of always exactly 1.
     wire evict_other_dirty = (evict_want0 && snoop0_resp_hit && snoop0_resp_dirty) ||
-                              (evict_want1 && snoop1_resp_hit && snoop1_resp_dirty);
-    wire [LINE_BYTES*8-1:0] evict_other_data = evict_want0 ? snoop0_resp_data : snoop1_resp_data;
-    wire normal_other_dirty = normal_snoop && (req_core ? (snoop0_resp_hit && snoop0_resp_dirty)
-                                                          : (snoop1_resp_hit && snoop1_resp_dirty));
-    wire [LINE_BYTES*8-1:0] normal_other_data = req_core ? snoop0_resp_data : snoop1_resp_data;
+                              (evict_want1 && snoop1_resp_hit && snoop1_resp_dirty) ||
+                              (evict_want_gpu && snoop_gpu_resp_hit && snoop_gpu_resp_dirty);
+    wire [LINE_BYTES*8-1:0] evict_other_data =
+        (evict_want0 && snoop0_resp_hit && snoop0_resp_dirty) ? snoop0_resp_data :
+        (evict_want1 && snoop1_resp_hit && snoop1_resp_dirty) ? snoop1_resp_data :
+                                                                   snoop_gpu_resp_data;
+    wire normal_other_dirty = (normal_want0 && snoop0_resp_hit && snoop0_resp_dirty) ||
+                               (normal_want1 && snoop1_resp_hit && snoop1_resp_dirty) ||
+                               (normal_want_gpu && snoop_gpu_resp_hit && snoop_gpu_resp_dirty);
+    wire [LINE_BYTES*8-1:0] normal_other_data =
+        (normal_want0 && snoop0_resp_hit && snoop0_resp_dirty) ? snoop0_resp_data :
+        (normal_want1 && snoop1_resp_hit && snoop1_resp_dirty) ? snoop1_resp_data :
+                                                                    snoop_gpu_resp_data;
 
     // ---- Phase 9 (ECC): one shared decode/encode instance, keyed on
     // req_idx -- unlike l1_cache.v, only one L2 transaction is ever in
@@ -271,29 +328,35 @@ module l2_cache #(
         if (reset) begin
             fsm <= ST_IDLE;
             mem_vread <= 1'b0; mem_vwrite <= 1'b0;
-            c0_resp_valid <= 1'b0; c1_resp_valid <= 1'b0;
+            c0_resp_valid <= 1'b0; c1_resp_valid <= 1'b0; gpu_resp_valid <= 1'b0;
             access_sbe <= 1'b0; access_dbe <= 1'b0;
             for (li = 0; li < L2_LINES; li = li + 1) begin
                 l2_valid[li] <= 1'b0;
                 l2_check[li] <= {LINE_BYTES{1'b0}};
                 presence0[li] <= 1'b0;
                 presence1[li] <= 1'b0;
+                presence_gpu[li] <= 1'b0;
             end
         end else begin
             c0_resp_valid <= 1'b0;
             c1_resp_valid <= 1'b0;
+            gpu_resp_valid <= 1'b0;
             mem_vread <= 1'b0;
             mem_vwrite <= 1'b0;
 
             case (fsm)
                 ST_IDLE: begin
                     if (c0_req_valid) begin
-                        req_core <= 1'b0;
+                        req_core <= AG_C0;
                         req_type_r <= c0_req_type; req_addr_r <= c0_req_addr; req_wbdata_r <= c0_req_wb_data;
                         fsm <= ST_EVICT_SNOOP;
                     end else if (c1_req_valid) begin
-                        req_core <= 1'b1;
+                        req_core <= AG_C1;
                         req_type_r <= c1_req_type; req_addr_r <= c1_req_addr; req_wbdata_r <= c1_req_wb_data;
+                        fsm <= ST_EVICT_SNOOP;
+                    end else if (gpu_req_valid) begin
+                        req_core <= AG_GPU;
+                        req_type_r <= gpu_req_type; req_addr_r <= gpu_req_addr; req_wbdata_r <= gpu_req_wb_data;
                         fsm <= ST_EVICT_SNOOP;
                     end
                 end
@@ -318,12 +381,18 @@ module l2_cache #(
                         l2_data[req_idx]  <= l2_write_value;
                         l2_check[req_idx] <= l2_write_check;
                         mem_vwrite <= 1'b1; mem_vaddr <= line_addr_of(req_tag, req_idx); mem_vwdata <= req_wbdata_r;
-                        if (req_core) presence1[req_idx] <= 1'b1; else presence0[req_idx] <= 1'b1;
+                        case (req_core)
+                            AG_C0:  presence0[req_idx]    <= 1'b1;
+                            AG_C1:  presence1[req_idx]    <= 1'b1;
+                            AG_GPU: presence_gpu[req_idx] <= 1'b1;
+                            default: ;
+                        endcase
                         fsm <= ST_RESPOND;
                     end
-                    else if (evict_needed && (presence0[req_idx] || presence1[req_idx])) begin
+                    else if (evict_needed && (presence0[req_idx] || presence1[req_idx] || presence_gpu[req_idx])) begin
                         presence0[req_idx] <= 1'b0;
                         presence1[req_idx] <= 1'b0;
+                        presence_gpu[req_idx] <= 1'b0;
                         other_had_dirty  <= evict_other_dirty;
                         other_dirty_data <= evict_other_data;
                         fsm <= ST_EVICT_MEMWR;
@@ -394,10 +463,21 @@ module l2_cache #(
                 // needed) this same cycle -- consume the (already valid)
                 // response directly.
                 ST_SNOOP_OTHER: begin
-                    if (normal_snoop && (req_type_r != REQ_BUSRD)) begin
-                        if (req_core) presence0[req_idx] <= 1'b0; else presence1[req_idx] <= 1'b0;
+                    // Phase 15: invalidate whichever non-requesting
+                    // agent(s) this exclusive-type request actually
+                    // snooped-and-hit -- up to 2 now, not always exactly
+                    // 1 -- then mark the requester itself present.
+                    if (req_type_r != REQ_BUSRD) begin
+                        if (normal_want0)    presence0[req_idx]    <= 1'b0;
+                        if (normal_want1)    presence1[req_idx]    <= 1'b0;
+                        if (normal_want_gpu) presence_gpu[req_idx] <= 1'b0;
                     end
-                    if (req_core) presence1[req_idx] <= 1'b1; else presence0[req_idx] <= 1'b1;
+                    case (req_core)
+                        AG_C0:  presence0[req_idx]    <= 1'b1;
+                        AG_C1:  presence1[req_idx]    <= 1'b1;
+                        AG_GPU: presence_gpu[req_idx] <= 1'b1;
+                        default: ;
+                    endcase
 
                     if (normal_other_dirty) begin
                         // The other core's copy was more current than
@@ -424,15 +504,24 @@ module l2_cache #(
                 // it only waits for l2_resp_valid before issuing the *real*
                 // request for the line it actually wanted.
                 ST_RESPOND: begin
-                    if (req_core) begin
-                        c1_resp_valid <= 1'b1;
-                        c1_resp_data <= l2_line_corrected;
-                        c1_resp_exclusive <= !presence0[req_idx];
-                    end else begin
-                        c0_resp_valid <= 1'b1;
-                        c0_resp_data <= l2_line_corrected;
-                        c0_resp_exclusive <= !presence1[req_idx];
-                    end
+                    case (req_core)
+                        AG_C0: begin
+                            c0_resp_valid <= 1'b1;
+                            c0_resp_data <= l2_line_corrected;
+                            c0_resp_exclusive <= !presence1[req_idx] && !presence_gpu[req_idx];
+                        end
+                        AG_C1: begin
+                            c1_resp_valid <= 1'b1;
+                            c1_resp_data <= l2_line_corrected;
+                            c1_resp_exclusive <= !presence0[req_idx] && !presence_gpu[req_idx];
+                        end
+                        AG_GPU: begin
+                            gpu_resp_valid <= 1'b1;
+                            gpu_resp_data <= l2_line_corrected;
+                            gpu_resp_exclusive <= !presence0[req_idx] && !presence1[req_idx];
+                        end
+                        default: ;
+                    endcase
                     access_sbe <= l2_line_sbe;
                     access_dbe <= l2_line_dbe;
                     fsm <= ST_COOLDOWN;

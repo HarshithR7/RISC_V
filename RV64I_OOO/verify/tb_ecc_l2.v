@@ -39,6 +39,13 @@ module tb_ecc_l2;
         .snoop0_resp_hit(1'b0), .snoop0_resp_dirty(1'b0), .snoop0_resp_data({VLEN{1'b0}}),
         .snoop1_req_valid(), .snoop1_req_type(), .snoop1_req_addr(),
         .snoop1_resp_hit(1'b0), .snoop1_resp_dirty(1'b0), .snoop1_resp_data({VLEN{1'b0}}),
+        // Phase 15: 3rd (GPU) coherent port, unused by this test -- tied
+        // off explicitly rather than left floating, same as c1/snoop1
+        // above (this module predates that port entirely).
+        .gpu_req_valid(1'b0), .gpu_req_type(2'b0), .gpu_req_addr(64'b0), .gpu_req_wb_data({VLEN{1'b0}}),
+        .gpu_resp_valid(), .gpu_resp_data(), .gpu_resp_exclusive(),
+        .snoop_gpu_req_valid(), .snoop_gpu_req_type(), .snoop_gpu_req_addr(),
+        .snoop_gpu_resp_hit(1'b0), .snoop_gpu_resp_dirty(1'b0), .snoop_gpu_resp_data({VLEN{1'b0}}),
         .ecc_l2_sbe_fault(ecc_sbe), .ecc_l2_dbe_fault(ecc_dbe)
     );
 
