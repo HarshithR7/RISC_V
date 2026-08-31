@@ -12,15 +12,19 @@ RV64IMACFD+RVV feature set.
 
 ## Status
 
-**Phases 1 through 12 are all complete: 33/33 single-core full-pipeline
-tests pass, plus a dedicated 2-core coherency test**, plus 21/21 isolated
-ROB+RAT unit-test checks, 15/15 standalone divider unit tests, 13/13
-isolated L1/L2 MESI coherency checks, 2/2 lockstep DMR checks, 6/6
-isolated ECC checks, and 3/3 isolated Phase 10 memory-optimization
-checks (prefetch, hit-under-miss, merging write buffer) — all still
-passing, unchanged, after Phase 11's fetch-latency retiming and Phase
-12's AXI-loadable backing *and* instruction memory, both for real FPGA
-bring-up (see below), plus 4 new isolated Phase 12 checks of its own.
+**Phases 1 through 15 are all complete: 36/36 single-core full-pipeline
+tests pass (33 pre-existing + 3 new Phase 13 RAS tests), plus a dedicated
+2-core coherency test**, plus 21/21 isolated ROB+RAT unit-test checks,
+15/15 standalone divider unit tests, 13/13 isolated L1/L2 MESI coherency
+checks (plus a separate 14/14 3-way coherency check -- Phase 15, below),
+2/2 lockstep DMR checks, 6/6 isolated ECC checks, and 3/3 isolated
+Phase 10 memory-optimization checks (prefetch, hit-under-miss, merging
+write buffer) — all still passing, unchanged, through Phase 11's
+fetch-latency retiming, Phase 12's AXI-loadable backing *and*
+instruction memory plus its AXI-lite control/status peripheral and
+`fpga_top.v` (all for real FPGA bring-up, see below), Phase 13's Return
+Address Stack, Phase 14's doubled OoO issue window, and Phase 15's
+GPU-class coherent interconnect port on the shared L2.
 
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
@@ -64,6 +68,24 @@ bring-up (see below), plus 4 new isolated Phase 12 checks of its own.
   of the whole pipeline stalling on it), and a real merging write buffer
   — see "Phase 10: memory-hierarchy optimizations" below for what's
   covered, what's a documented non-goal, and why.
+- **Phase 11**: registered (1-cycle-latency) fetch, retiming the pipeline
+  for real FPGA Block RAM timing (no combinational-read mode at this
+  design's capacity) — a PYNQ-Z1 bring-up prerequisite; see "Phase 11:
+  FPGA bring-up — registered fetch" below.
+- **Phase 12**: AXI-loadable instruction and data memory, an AXI4-Lite
+  control/status peripheral (`axi_ooo_ctrl.v`), and the top-level FPGA
+  IP block (`fpga_top.v`) — the PS side can load a program and start the
+  cores without re-synthesizing; see "Phase 12" and "Phase 12 continued"
+  below.
+- **Phase 13**: a Return Address Stack — real hardware speculation for
+  return-shaped JALR instead of the original stall-until-resolved path;
+  see "Phase 13: Return Address Stack (RAS)" below.
+- **Phase 14**: the OoO issue window (ROB/RS/LSQ depths) doubled across
+  the board; see "Phase 14: doubling the OoO issue window" below.
+- **Phase 15**: `l2_cache.v` generalized from 2 hardcoded requesters to a
+  real 3-agent MESI director — a GPU-class coherent interconnect port,
+  with no GPU compute core implied or built; see "Phase 15: GPU-class
+  coherent interconnect port on the shared L2" below.
 
 Tests cover RAW/WAR/WAW hazards (including intra-group ones specific to
 2-wide dispatch), a real backward-branch loop (which, as a side effect of
@@ -82,15 +104,23 @@ intra-group forwarding and intra-group WAW.
 |---|---|---|
 | `riscv64_ooo_proc.v` | `riscv64_ooo_proc` | Top level: fetch/decode/rename/dispatch, CDB arbiter, commit |
 | `decode_ooo.v` | `decode_ooo` | Combinational RV64I+M decode, classified by destination RS bank |
-| `rat.v` | `rat` | Register Alias Table (single, no speculation checkpointing yet) |
-| `rob.v` | `rob` | Reorder buffer: in-order commit, precise state |
-| `alu_rs.v` | `alu_rs` | ALU reservation stations (4 entries) + combinational 1-cycle ALU |
+| `rat.v` | `rat` | Register Alias Table, single speculation checkpoint (save/restore, Phase 2) |
+| `rob.v` | `rob` | Reorder buffer (16 entries, Phase 14): in-order commit, precise state |
+| `alu_rs.v` | `alu_rs` | ALU reservation stations (8 entries, Phase 14) + combinational 1-cycle ALU |
 | `branch_rs.v` | `branch_rs` | Branch/JAL/JALR reservation station (exactly 1 entry) |
-| `mul_rs.v` | `mul_rs` | Multiply reservation stations (2 entries) + combinational 1-cycle multiplier |
+| `mul_rs.v` | `mul_rs` | Multiply reservation stations (4 entries, Phase 14) + combinational 1-cycle multiplier |
 | `div_rs.v` | `div_rs` | Divide reservation station (1 entry), wraps `div_fu` |
 | `div_fu.v` | `div_fu` | Iterative (multi-cycle) restoring-division functional unit |
-| `lsq.v` | `lsq` | Load-store queue (4 entries), age-ordered alias disambiguation |
+| `lsq.v` | `lsq` | Load-store queue (8 entries, Phase 14), age-ordered alias disambiguation |
 | `bht.v` | `bht` | Branch History Table: 2-bit saturating-counter direction prediction (Phase 2) |
+| `ras.v` | `ras` | Return Address Stack: per-thread LIFO, speculative return prediction (Phase 13) |
+| `l1_cache.v` | `l1_cache` | Private per-core L1, direct-mapped, real MESI states (Phase 8) |
+| `l2_cache.v` | `l2_cache` | Shared L2 + MESI director, now a 3-agent coherent interconnect (Phase 8, 15) |
+| `instruction_fetch_reg.v` | `instruction_fetch_reg` | Registered-fetch wrapper, `USE_AXI_MEM`-selectable (Phase 11-12) |
+| `instruction_fetch_axi.v` | `instruction_fetch_axi` | AXI-loadable instruction memory (Phase 12) |
+| `data_memory_axi.v` | `data_memory_axi` | AXI-loadable L2 backing memory, vector port only (Phase 12) |
+| `axi_ooo_ctrl.v` | `axi_ooo_ctrl` | Hand-written AXI4-Lite control/status peripheral (Phase 12) |
+| `fpga_top.v` | `fpga_top` | Top-level FPGA IP block for PYNQ-Z1 bring-up (Phase 12) |
 
 Reused unchanged from the single-cycle RV64I core: `program_counter.v`,
 `instruction_fetch.v` (RVC halfword-awareness simply unused — PC always
@@ -1614,7 +1644,172 @@ mirroring to both instances, not just one.
 - **Zero regressions**: the full pre-existing suite, including the
   dual-core and lockstep tests (which instantiate `riscv64_ooo_proc.v`/
   `dual_core_riscv64_ooo.v` directly), passes with identical cycle counts.
-- **Not done yet**: the AXI-lite control/status register block, the
-  top-level FPGA wrapper tying the AXI-lite peripherals to
-  `dual_core_riscv64_ooo.v`'s new ports, the Vivado block-design/TCL
-  work, and the PYNQ Python driver.
+- **Not done yet** (as of this section): the AXI-lite control/status
+  register block and top-level FPGA wrapper -- see the next section,
+  where both got built. The Vivado block-design/TCL work and the PYNQ
+  Python driver remain unstarted.
+
+## Phase 12 continued: AXI-lite control/status peripheral + `fpga_top.v`
+
+The piece Phase 12 above left undone: something on the PS side that can
+actually load a program and start the cores, once they're sitting in
+`dual_core_riscv64_ooo.v` with `USE_AXI_MEM=1`.
+
+- **`axi_ooo_ctrl.v`** (new): a hand-written AXI4-Lite slave -- not
+  generated from Vivado's IP catalog, so the write address/data channel
+  handshake (`AWVALID`/`WVALID` must both be up before either `READY`
+  asserts), the write response channel, and the read channel are all real
+  RTL, not a black box. Address map: `CONTROL` (0x00000, bit 0 =
+  `core_reset`, active-high, defaults to 1 -- cores stay held in reset
+  until the PS explicitly releases them once loading is complete),
+  `STATUS` (0x00004, one halt bit per thread), 8 per-thread PC-readback
+  registers (0x00008-0x00024), and 5 memory-mapped windows (4 instruction
+  memories + 1 shared data memory) at 0x10000/0x20000/0x30000/0x40000/
+  0x50000, each forwarding writes straight to the matching
+  `dual_core_riscv64_ooo.v` AXI write port from Phase 12 above.
+- **Sticky halt latches**: `ecall_halt0..3` are bare one-cycle
+  combinational commit pulses (see `riscv64_ooo_proc.v`) -- a software
+  poll loop reading `STATUS` over AXI can land on any cycle and has no
+  guarantee of ever sampling the exact cycle a pulse is high. Found via
+  `tb_fpga_top.v` (below) timing out with `STATUS` stuck at 0 despite the
+  cores having actually halted; fixed with per-thread latch registers in
+  `axi_ooo_ctrl.v` that set on the pulse and clear only on `core_reset` --
+  a real design gap in the new peripheral, not a workaround.
+- **`fpga_top.v`** (new): the actual top-level IP block for the Vivado
+  Block Design -- `axi_ooo_ctrl.v` + `dual_core_riscv64_ooo.v`
+  (`USE_AXI_MEM=1`), a single clock domain (`S_AXI_ACLK` reused directly
+  as the cores' clock, no CDC), exposing only the S_AXI_* port set at its
+  own boundary. `S_AXI_ARESETN` (AXI-side, resets `axi_ooo_ctrl.v`'s own
+  registers) is deliberately kept separate from `core_reset` (this
+  project's own convention, software-controlled via `CONTROL`) -- a bus
+  reset must not silently lose an already-loaded program.
+- **Verified with `tb_axi_ooo_ctrl.v`** (a real AXI4-Lite bus-functional
+  model, `axi_write`/`axi_read` tasks) and **`tb_fpga_top.v`** (end to
+  end: AXI-load a trivial program into all 4 threads, release
+  `core_reset` via `CONTROL`, poll `STATUS` until all 4 halt bits are
+  set) -- both pass. Getting there surfaced one simulation-only artifact
+  (loading only 1 instruction per thread left `pc+4`, the 2-wide fetch's
+  lane-1 target, at simulation-X; real Block RAM has no such state, so
+  this was a testbench gap, fixed by loading enough real content) and the
+  sticky-latch bug above.
+- **Not done yet**: the Vivado block-design/TCL work and the PYNQ Python
+  driver -- `fpga_top.v` is the IP block meant to be dropped into that
+  Block Design, not yet actually done.
+
+## Phase 13: Return Address Stack (RAS)
+
+JALR previously had exactly one behavior regardless of shape: stall
+dispatch of everything behind it until the branch-class reservation
+station resolves the real target (`branch_rs.v`'s own header: "no BTB in
+this scope to predict it"). Real cores don't pay that cost for the single
+most common indirect jump -- a function return -- because they predict it
+with a small LIFO. This phase adds that.
+
+- **`ras.v`** (new): a per-thread LIFO, `DEPTH` entries (default 8).
+  Combinational top-of-stack read (`top_addr`/`top_valid`), registered
+  push/pop. No checkpoint/restore port, unlike `rat.v`'s speculation
+  support -- and deliberately so: `branch_rs.v` holds exactly one resident
+  entry and blocks any new branch-class dispatch until it resolves, so a
+  RAS push or pop can never happen while an earlier branch/JALR's own
+  misprediction is still undetected. By the time a new call or return
+  reaches dispatch, any earlier speculative window has already resolved
+  and, if it mispredicted, already squashed -- there's never a wrong-path
+  push to unwind, and a return-shaped JALR's own pop is never "wrong" to
+  have issued regardless of whether the *predicted target* turns out
+  right (the instruction really is a return either way; only the
+  predicted address can be wrong, and that's corrected the normal way).
+- **Classification** (`riscv64_ooo_proc.v`): a call is JAL/JALR writing a
+  link register (x1/ra or x5); a return is JALR reading a link register
+  into a *non*-link `rd`. The mixed case (`rd` and `rs1` both link
+  registers -- a tail-call-shaped encoding) and any JALR through a
+  non-link register (an indirect call through a function pointer, a
+  jump-table dispatch) are deliberately left unpredicted, falling back to
+  the original stall path unchanged.
+- **Misprediction recovery reuses the existing generic squash path**, not
+  a new one: `t0_mispredict` now compares a RAS-predicted *target*
+  against the actual resolved target when the speculative window came
+  from a predicted return (`t0_spec_is_jalr`), the same way it already
+  compared a BHT-predicted *direction* against a resolved branch's actual
+  outcome -- both drive the same `t0_branch_resolved_tag`-keyed squash
+  that RAT checkpoint/restore and ROB/RS/LSQ squash-by-tag already
+  implement. The old unconditional "any resolving JALR forces a redirect"
+  latch (`jalr_outstanding`) narrows to `jalr_stall_active`: only set for
+  JALRs this design still can't predict, since `branch_rs.v`'s own
+  single-slot occupancy already blocks new branch-class dispatch on its
+  own regardless.
+- **Verified with 3 new directed tests**: `ooo_ras_nested_calls` (2-deep
+  call/return with real save/restore of `ra` around the nested call,
+  proving LIFO ordering under real depth, not just one push/pop --
+  `ooo_jal_jalr` already covered that), `ooo_ras_misprediction` (a
+  deliberate mismatch via a nonzero `jalr` immediate offset -- no address
+  arithmetic needed, since the RAS always predicts `rs1` itself at offset
+  0 -- proving squash/redirect discards the wrongly-speculated fetch down
+  the RAS-predicted path), and `ooo_ras_nonlink_fallback` (a call/return
+  through x2, not a link register, proving the fallback path is
+  unaffected).
+- **Zero regressions**: 36/36 single-core (33 pre-existing + 3 new),
+  dual-core, lockstep, and the `fpga_top.v`/`axi_ooo_ctrl.v` end-to-end
+  test all pass unchanged.
+
+## Phase 14: doubling the OoO issue window
+
+`ROB_DEPTH`/`ALU_RS_DEPTH`/`MUL_RS_DEPTH`/`LSQ_DEPTH` were 8/4/2/4 from
+Phase 1 onward -- deliberately minimal, "just enough to prove OoO
+execution works" sizing. Every downstream structure (tag width via
+`$clog2(ROB_DEPTH)`, CAM-searched RS wakeup, ROB/RS/LSQ squash-by-tag)
+was already genuinely parameterized off these values, not hardcoded to
+them, so doubling to 16/8/4/8 was a pure capacity increase -- propagated
+through `riscv64_ooo_proc.v`, `dual_core_riscv64_ooo.v`, and
+`fpga_top.v`'s own default parameters (all three needed updating; the
+FPGA wrapper re-declares its own defaults rather than deferring to the
+core's).
+
+- **Zero regressions, with a real signal it wasn't a no-op**: the full
+  regression passes unchanged, and dual-core cycle counts shift slightly
+  (53->54, 87->93 cycles) -- confirming the deeper structures actually
+  took effect rather than being silently unused.
+- **Direct-mapped L1/L2 remain a known, documented scope boundary** (see
+  `l1_cache.v`/`l2_cache.v`'s own headers) -- set-associative caches are
+  real future work, not attempted here.
+
+## Phase 15: GPU-class coherent interconnect port on the shared L2
+
+`l2_cache.v` was hardcoded for exactly 2 requesters (core0's/core1's own
+L1s) from Phase 8 onward. This phase generalizes it to a real 3rd
+coherent port -- the actual interconnect fabric a GPU-class accelerator
+(or any other coherent agent) would attach to -- without building any
+GPU compute core, since the fabric's own protocol is the real
+deliverable.
+
+- **`l2_cache.v`**: a new `gpu_req_*`/`gpu_resp_*`/`snoop_gpu_*` port,
+  identical in shape to core0's/core1's own -- the exact same req/resp +
+  snoop protocol `l1_cache.v` already speaks, so any future agent
+  (including a real GPU's own cache hierarchy) that speaks this shape
+  plugs into the identical port. `req_core` widens from 1 bit to 2
+  (`AG_C0`/`AG_C1`/`AG_GPU`); `presence0`/`presence1` gain a
+  `presence_gpu` sibling; every place that used to assume "the other
+  agent" (a plain NOT of the requester) is now an explicit per-agent
+  want-flag (`evict_want0/1/gpu`, `normal_want0/1/gpu`) -- a
+  generalization of a pattern the eviction path already used for exactly
+  one case (a replaced line held by both requesters at once), not a new
+  one. Fixed-priority arbitration (core0 > core1 > gpu) extends the
+  module's existing "thread 0 always wins" convention by one.
+- **`dual_core_riscv64_ooo.v` ties the new port off** (`gpu_req_valid`
+  tied to 0, matching the existing tie-off convention for unused ports
+  elsewhere in this project) so every existing 2-agent instantiation is
+  byte-for-byte unchanged -- confirmed by the full regression passing
+  with identical cycle counts to before this phase.
+- **Verified with `tb_l2_three_way.v`** (new): reuses `l1_cache.v`
+  unmodified as a stand-in "GPU cache" (a real accelerator's own cache
+  hierarchy would replace it in an actual integration) and drives a real
+  3-way scenario `tb_cache_mesi.v`'s 2-agent version structurally cannot
+  reach -- a line shared by all 3 agents at once, then a `BusUpgr` that
+  must invalidate TWO other agents in the same cycle (the actual new
+  logic this phase added). All 14 checks pass; `tb_cache_mesi.v` and
+  `tb_ecc_l2.v` (updated with explicit gpu-port ties, same style as their
+  existing c1/snoop1 ties) still pass unchanged.
+- **Not done yet**: no GPU compute core exists or is planned in this
+  scope -- `dual_core_riscv64_ooo.v` doesn't expose the new port at its
+  own top level either, by design, to keep this phase's risk contained to
+  `l2_cache.v` itself; a real integration would expose it there and wire
+  a real accelerator's cache hierarchy onto it.
