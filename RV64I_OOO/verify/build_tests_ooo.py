@@ -34,7 +34,7 @@ REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "da
               "vector_register_file.v", "vector_alu.v"]
 # New for the out-of-order core.
 OOO_RTL = ["decode_ooo.v", "rat.v", "vec_rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v",
-           "div_fu.v", "lsq.v", "bht.v", "vec_rs.v", "l1_cache.v", "l2_cache.v",
+           "div_fu.v", "lsq.v", "bht.v", "ras.v", "vec_rs.v", "l1_cache.v", "l2_cache.v",
            "ecc64.v", "ecc_line.v", "ecc_register_file.v", "instruction_fetch_reg.v",
            "instruction_fetch_axi.v", "data_memory_axi.v",
            "riscv64_ooo_proc.v", "riscv64_ooo_proc_solo.v"]
@@ -316,6 +316,84 @@ jalr x0, x1, 0
 end:
 """)
     t.check_eq("x5", 1015)  # 10 -> func adds 5 -> 15 -> back adds 1000 -> 1015
+    return t
+
+
+def t_ras_nested_calls():
+    # Phase 13 (RAS): two real levels of call/return -- funcA calls funcB,
+    # each saving/restoring its own return address (x1/ra) around the
+    # nested call, the standard calling convention -- proves the RAS's
+    # LIFO ordering under real stack depth, not just a single push/pop
+    # (which t_jal_jalr above already covers).
+    t = TestBuilder("ooo_ras_nested_calls")
+    t.asm("""
+li x5, 1
+jal x1, funcA
+addi x5, x5, 1000
+j end
+funcA:
+addi x9, x1, 0
+addi x5, x5, 10
+jal x1, funcB
+addi x5, x5, 100
+addi x1, x9, 0
+jalr x0, x1, 0
+funcB:
+addi x5, x5, 2
+jalr x0, x1, 0
+end:
+""")
+    t.check_eq("x5", 1113)  # 1 -> +10 (funcA) -> +2 (funcB) -> +100 (funcA cont'd) -> +1000 (back at caller)
+    return t
+
+
+def t_ras_misprediction():
+    # Phase 13 (RAS): forces a genuine RAS misprediction using a nonzero
+    # jalr immediate offset -- no manual address arithmetic needed. `jal
+    # x1, funcA` pushes the real return address (L1, the very next
+    # instruction) onto the RAS; `jalr x0, x1, 4` inside funcA computes its
+    # ACTUAL target as x1+4 (one instruction past L1), which the RAS
+    # (which only ever predicts x1 itself, offset 0) cannot know about --
+    # a deliberate, deterministic mismatch. If misprediction squash/
+    # redirect (the same generic mechanism a mispredicted branch already
+    # relies on -- see t0_mispredict's definition) didn't correctly
+    # discard the wrongly-speculated fetch down the RAS-predicted (wrong,
+    # L1) path, x5 would pick up L1's own +1000 that must never actually
+    # execute.
+    t = TestBuilder("ooo_ras_misprediction")
+    t.asm("""
+li x5, 1
+jal x1, funcA
+addi x5, x5, 1000
+j end
+funcA:
+addi x5, x5, 10
+jalr x0, x1, 4
+end:
+""")
+    t.check_eq("x5", 11)
+    return t
+
+
+def t_ras_nonlink_fallback():
+    # Phase 13 (RAS): a call/return pair through x2 -- NOT a link register
+    # (x1/ra or x5) -- is deliberately outside this design's RAS
+    # classification (ras_push_it/ras_pop_it both require a link register;
+    # see riscv64_ooo_proc.v). Confirms it still falls back cleanly to the
+    # original Phase 1 stall-until-resolved path instead of being (wrongly)
+    # treated as a predictable return.
+    t = TestBuilder("ooo_ras_nonlink_fallback")
+    t.asm("""
+li x5, 1
+jal x2, funcA
+addi x5, x5, 1000
+j end
+funcA:
+addi x5, x5, 10
+jalr x0, x2, 0
+end:
+""")
+    t.check_eq("x5", 1011)
     return t
 
 
@@ -941,7 +1019,9 @@ def main():
         print(line)
         results.append(line)
 
-    for fn in [t_branch_taken_not_taken, t_jal_jalr, t_war_hazard, t_waw_hazard, t_backward_branch_loop,
+    for fn in [t_branch_taken_not_taken, t_jal_jalr,
+               t_ras_nested_calls, t_ras_misprediction, t_ras_nonlink_fallback,
+               t_war_hazard, t_waw_hazard, t_backward_branch_loop,
                t_stable_operand_loop,
                t_mul_basic, t_mulw, t_mul_rs_exhaustion,
                t_div_basic, t_div_by_zero, t_divw, t_div_back_to_back,

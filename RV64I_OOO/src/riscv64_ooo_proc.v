@@ -189,6 +189,8 @@ module riscv64_ooo_proc #(
     parameter ALU_RS_DEPTH = 4,
     parameter MUL_RS_DEPTH = 2,
     parameter LSQ_DEPTH = 4,
+    // Phase 13 (RAS): per-thread return-address-stack depth -- see ras.v.
+    parameter RAS_DEPTH = 8,
     // Phase 4 benchmarking knob: forces lane 1 to never fire, turning
     // this same RTL into a single-issue machine for a direct,
     // apples-to-apples dispatch-width comparison. Applies identically to
@@ -1309,9 +1311,18 @@ module riscv64_ooo_proc #(
     assign t1_rob_mark2_tag   = t1_branch_resolved_tag;
 
     // ---- Branch prediction + speculation (Phase 2, per thread) ------------
-    wire t0_jalr_outstanding = t0_branch_resident_is_jalr;
-    wire t1_jalr_outstanding = t1_branch_resident_is_jalr;
-    wire jalr_outstanding = active_thread ? t1_jalr_outstanding : t0_jalr_outstanding;
+    // Phase 13 (RAS): a resident JALR only forces the old unconditional
+    // "block everything until resolved" stall when it's NOT a RAS-
+    // predicted return -- see ras_pop_it/t0_ras_top_valid below.
+    // branch_rs.v's own single-slot occupancy already blocks any NEW
+    // branch-class dispatch on its own (see its header), so the only thing
+    // this per-thread latch still needs to do is keep blocking *non*-
+    // branch-class instructions for the JALRs this design still can't
+    // predict -- renamed from the old, always-unconditional
+    // jalr_outstanding to make that narrowed scope explicit.
+    reg t0_jalr_stall_active;
+    reg t1_jalr_stall_active;
+    wire jalr_stall_active = active_thread ? t1_jalr_stall_active : t0_jalr_stall_active;
 
     // BHT: single shared instance (see module header) -- predicts for
     // whichever thread is currently dispatching (predict_pc = the muxed
@@ -1329,44 +1340,125 @@ module riscv64_ooo_proc #(
         .update_taken(bht_update_use_t0 ? t0_branch_resolved_taken : t1_branch_resolved_taken)
     );
 
+    // ---- Phase 13: Return Address Stack (per thread) -----------------------
+    // Call/return classification off the shared, active-thread-muxed decode
+    // fields -- see ras.v's header for why a plain per-thread LIFO needs no
+    // speculation checkpoint of its own here. x1 (ra) and x5 (the RISC-V
+    // calling convention's alternate link register) both count as "link",
+    // matching the standard call/return hint encoding.
+    wire d0_rd_is_link  = (d0_rd  == 5'd1) || (d0_rd  == 5'd5);
+    wire d0_rs1_is_link = (d0_rs1 == 5'd1) || (d0_rs1 == 5'd5);
+    // A call: JAL or JALR writing a link register -- always pushes,
+    // regardless of whether this same instruction also reads a link
+    // register (see ras_pop_it below for why that mixed case is excluded
+    // from prediction rather than treated as "pop then push").
+    wire ras_push_it = (d0_is_jal || d0_is_jalr) && d0_rd_is_link;
+    // A return: JALR reading a link register into a non-link rd. The
+    // rd-is-also-link case (a tail-call-shaped encoding) is deliberately
+    // left unpredicted -- it falls back to this design's original stall
+    // path, same as any other JALR this module doesn't classify as a call
+    // or a return.
+    wire ras_pop_it  = d0_is_jalr && d0_rs1_is_link && !d0_rd_is_link;
+
+    wire [63:0] t0_ras_top_addr; wire t0_ras_top_valid;
+    wire t0_ras_push_req = (active_thread == 1'b0) && lane0_fire && ras_push_it;
+    wire t0_ras_pop_req  = (active_thread == 1'b0) && lane0_fire && ras_pop_it && t0_ras_top_valid;
+    ras #(.DEPTH(RAS_DEPTH)) t0_ras_i (
+        .clk(clk), .reset(reset),
+        .top_addr(t0_ras_top_addr), .top_valid(t0_ras_top_valid),
+        .push_req(t0_ras_push_req), .push_addr(pc + 64'd4),
+        .pop_req(t0_ras_pop_req)
+    );
+
+    wire [63:0] t1_ras_top_addr; wire t1_ras_top_valid;
+    wire t1_ras_push_req = (active_thread == 1'b1) && lane0_fire && ras_push_it;
+    wire t1_ras_pop_req  = (active_thread == 1'b1) && lane0_fire && ras_pop_it && t1_ras_top_valid;
+    ras #(.DEPTH(RAS_DEPTH)) t1_ras_i (
+        .clk(clk), .reset(reset),
+        .top_addr(t1_ras_top_addr), .top_valid(t1_ras_top_valid),
+        .push_req(t1_ras_push_req), .push_addr(pc + 64'd4),
+        .pop_req(t1_ras_pop_req)
+    );
+
     reg t0_spec_active;
+    reg t0_spec_is_jalr;              // Phase 13: which prediction source (BHT direction vs RAS target) this speculative window came from
     reg t0_predicted_taken_reg;
+    reg [63:0] t0_predicted_target_reg;
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             t0_spec_active <= 1'b0;
         end else if ((active_thread == 1'b0) && lane0_fire && d0_is_branch) begin
             t0_spec_active <= 1'b1;
+            t0_spec_is_jalr <= 1'b0;
             t0_predicted_taken_reg <= bht_predict_taken;
+        end else if (t0_ras_pop_req) begin
+            t0_spec_active <= 1'b1;
+            t0_spec_is_jalr <= 1'b1;
+            t0_predicted_target_reg <= t0_ras_top_addr;
         end else if (t0_branch_resolved) begin
             t0_spec_active <= 1'b0;
         end
     end
 
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            t0_jalr_stall_active <= 1'b0;
+        end else if ((active_thread == 1'b0) && lane0_fire && d0_is_jalr && !t0_ras_pop_req) begin
+            t0_jalr_stall_active <= 1'b1;
+        end else if (t0_branch_resolved) begin
+            t0_jalr_stall_active <= 1'b0;
+        end
+    end
+
     reg t1_spec_active;
+    reg t1_spec_is_jalr;
     reg t1_predicted_taken_reg;
+    reg [63:0] t1_predicted_target_reg;
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             t1_spec_active <= 1'b0;
         end else if ((active_thread == 1'b1) && lane0_fire && d0_is_branch) begin
             t1_spec_active <= 1'b1;
+            t1_spec_is_jalr <= 1'b0;
             t1_predicted_taken_reg <= bht_predict_taken;
+        end else if (t1_ras_pop_req) begin
+            t1_spec_active <= 1'b1;
+            t1_spec_is_jalr <= 1'b1;
+            t1_predicted_target_reg <= t1_ras_top_addr;
         end else if (t1_branch_resolved) begin
             t1_spec_active <= 1'b0;
         end
     end
 
-    wire t0_mispredict = t0_spec_active && t0_branch_resolved && (t0_branch_resolved_taken != t0_predicted_taken_reg);
-    wire t1_mispredict = t1_spec_active && t1_branch_resolved && (t1_branch_resolved_taken != t1_predicted_taken_reg);
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            t1_jalr_stall_active <= 1'b0;
+        end else if ((active_thread == 1'b1) && lane0_fire && d0_is_jalr && !t1_ras_pop_req) begin
+            t1_jalr_stall_active <= 1'b1;
+        end else if (t1_branch_resolved) begin
+            t1_jalr_stall_active <= 1'b0;
+        end
+    end
+
+    wire t0_mispredict = t0_spec_active && t0_branch_resolved &&
+        (t0_spec_is_jalr ? (t0_branch_resolved_next_pc != t0_predicted_target_reg)
+                          : (t0_branch_resolved_taken != t0_predicted_taken_reg));
+    wire t1_mispredict = t1_spec_active && t1_branch_resolved &&
+        (t1_spec_is_jalr ? (t1_branch_resolved_next_pc != t1_predicted_target_reg)
+                          : (t1_branch_resolved_taken != t1_predicted_taken_reg));
     // Used only inside the shared dispatch logic's "!mispredict" gate below
     // -- the active thread's own mispredict, discovered this exact cycle,
     // must block its own wrong-path dispatch.
     wire mispredict = active_thread ? t1_mispredict : t0_mispredict;
 
-    wire t0_rat_checkpoint_save = (active_thread == 1'b0) && lane0_fire && d0_is_branch;
-    wire t1_rat_checkpoint_save = (active_thread == 1'b1) && lane0_fire && d0_is_branch;
+    // Phase 13: also checkpoint on a RAS-predicted return, not just a
+    // conditional branch -- that's now a second source of speculation
+    // needing the same rollback-on-misprediction support.
+    wire t0_rat_checkpoint_save = (active_thread == 1'b0) && lane0_fire && (d0_is_branch || t0_ras_pop_req);
+    wire t1_rat_checkpoint_save = (active_thread == 1'b1) && lane0_fire && (d0_is_branch || t1_ras_pop_req);
 
-    wire t0_redirect_needed = t0_mispredict || (t0_jalr_outstanding && t0_branch_resolved);
-    wire t1_redirect_needed = t1_mispredict || (t1_jalr_outstanding && t1_branch_resolved);
+    wire t0_redirect_needed = t0_mispredict || (t0_jalr_stall_active && t0_branch_resolved);
+    wire t1_redirect_needed = t1_mispredict || (t1_jalr_stall_active && t1_branch_resolved);
 
     // ================================================================
     // ---- Dispatch (2-wide, active-thread view) -----------------------
@@ -1389,7 +1481,7 @@ module riscv64_ooo_proc #(
     // lane1_fire already depends on lane0_fire, so gating here alone is
     // enough for both lanes.
     wire lane0_fire = lane0_dispatchable && (rob_free_count >= 1) && !lane0_needed_rs_full &&
-                       !jalr_outstanding && !mispredict && !lane0_vmv_stall && fetch_valid;
+                       !jalr_stall_active && !mispredict && !lane0_vmv_stall && fetch_valid;
 
     wire lane0_breaks_flow = d0_is_jal || d0_is_jalr || (d0_is_branch && bht_predict_taken);
     wire lane1_dispatchable = d1_is_alu || d1_is_mul || d1_is_div || d1_is_load || d1_is_store;
@@ -1503,6 +1595,11 @@ module riscv64_ooo_proc #(
             t0_next_pc = t0_pc_latched + d0_imm;
         else if (active_thread == 1'b0 && lane0_fire && d0_is_branch && bht_predict_taken)
             t0_next_pc = t0_pc_latched + d0_imm;
+        // Phase 13: a RAS-predicted return redirects to the popped target
+        // instead of falling through -- t0_ras_pop_req already implies
+        // active_thread==0 && lane0_fire (see its own definition above).
+        else if (t0_ras_pop_req)
+            t0_next_pc = t0_ras_top_addr;
         else if (active_thread == 1'b0 && lane0_fire)
             t0_next_pc = lane1_fire ? (t0_pc_latched + 64'd8) : (t0_pc_latched + 64'd4);
         else
@@ -1517,6 +1614,8 @@ module riscv64_ooo_proc #(
             t1_next_pc = t1_pc_latched + d0_imm;
         else if (active_thread == 1'b1 && lane0_fire && d0_is_branch && bht_predict_taken)
             t1_next_pc = t1_pc_latched + d0_imm;
+        else if (t1_ras_pop_req)
+            t1_next_pc = t1_ras_top_addr;
         else if (active_thread == 1'b1 && lane0_fire)
             t1_next_pc = lane1_fire ? (t1_pc_latched + 64'd8) : (t1_pc_latched + 64'd4);
         else
