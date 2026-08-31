@@ -185,10 +185,17 @@ module riscv64_ooo_proc #(
     parameter IMEM_FILE0 = "instructions0.mem",
     parameter IMEM_FILE1 = "instructions1.mem",
     parameter IMEM_WORDS = 8192,
-    parameter ROB_DEPTH = 8,
-    parameter ALU_RS_DEPTH = 4,
-    parameter MUL_RS_DEPTH = 2,
-    parameter LSQ_DEPTH = 4,
+    // Phase 14 (competitive scaling): 8/4/2/4 was Phase 1's original,
+    // deliberately minimal "just enough to prove OoO works" sizing.
+    // Doubled across the board -- a real, if still FPGA-modest, step
+    // toward the OoO resources a competitive core carries (still tiny
+    // next to a real AMD/Intel core's 200+-entry ROB, but the actual
+    // structures -- CAM-searched RS wakeup, tag-based selective squash --
+    // are the same ones that scale, just parameterized smaller here).
+    parameter ROB_DEPTH = 16,
+    parameter ALU_RS_DEPTH = 8,
+    parameter MUL_RS_DEPTH = 4,
+    parameter LSQ_DEPTH = 8,
     // Phase 13 (RAS): per-thread return-address-stack depth -- see ras.v.
     parameter RAS_DEPTH = 8,
     // Phase 4 benchmarking knob: forces lane 1 to never fire, turning
