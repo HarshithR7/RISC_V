@@ -26,6 +26,39 @@ instruction memory plus its AXI-lite control/status peripheral and
 Address Stack, Phase 14's doubled OoO issue window, and Phase 15's
 GPU-class coherent interconnect port on the shared L2.
 
+**Phase 16 (3-wide superscalar) is complete and is the default
+configuration**: the dispatch/CDB/commit datapath is widened to 3-wide
+end to end, `alu_rs.v` has a genuine 3-way issue path, and
+`ENABLE_TRIPLE_ISSUE` defaults to **1** with no throttling anywhere in
+the 3-way issue/CDB-pick/commit path — full-rate, sustained-up-to-3-IPC
+operation is the real, always-on behavior, not an opt-in flag masking a
+known-risky path. All 36/36 single-core tests pass at this default,
+matching the pre-Phase-16 baseline while running genuinely 3-wide; see
+"Phase 16" below for the full writeup, including four real, now-fixed
+bugs found along the way — a missing 3rd-CDB-bus same-cycle bypass for
+dispatch lanes 0/1, stale standalone unit testbenches left with
+newly-added ROB/RAT ports floating, an `ecall`-as-commit-barrier gap
+that let a same-cycle, younger co-committing instruction stomp
+architectural state right after `ecall` retired (the actual root cause
+of what an earlier pass at this had only symptom-patched by delaying
+when the halt signal was *sampled*, not fixing what was allowed to
+*commit*), and a 3rd-lane dispatch resource-gating bug that silently
+dropped an `alu_rs`/`mul_rs`/`lsq` allocation whenever lane 2 wanted a
+bank that lane 1 (but not lane 0) also wanted that cycle, deadlocking
+the ROB on a tag nothing was ever going to broadcast.
+
+**Phase 17 (instruction cache + BTB) is complete and is the default
+configuration**: fetch now goes through a real, per-thread, direct-mapped
+instruction cache (`icache.v`) with a genuine, tunable miss latency,
+replacing the always-hit flat memory array every prior phase used; a new
+Branch Target Buffer (`btb.v`), scoped specifically to non-return
+indirect JALR prediction, replaces the old always-stall behavior for
+that class of jump. All 36/36 pre-existing tests plus 2 new dedicated
+BTB tests (38/38 total) pass, plus new standalone `icache.v`/`btb.v`
+unit suites; see "Phase 17" below for the feasibility reasoning, what
+was built, and direct, traced confirmation of a real BTB-sourced
+misprediction being caught and correctly recovered from.
+
 - **Phase 1**: Tomasulo + ROB, out-of-order execution, strictly in-order
   commit, no speculation. Every instruction class in scope (ALU,
   conditional branches, JAL/JALR, MUL/MULH/MULHSU/MULHU (+ W forms),
@@ -86,6 +119,16 @@ GPU-class coherent interconnect port on the shared L2.
   real 3-agent MESI director — a GPU-class coherent interconnect port,
   with no GPU compute core implied or built; see "Phase 15: GPU-class
   coherent interconnect port on the shared L2" below.
+- **Phase 16**: a feasibility analysis for this core's maximum practical
+  IPC, and a 3-wide dispatch/CDB/commit widening plus a 3-way `alu_rs.v`
+  issue path built against that analysis — enabled by default, full-rate,
+  no throttling, 36/36; see "Phase 16: 3-wide superscalar" below for the
+  analysis, what was built, and every bug found and fixed along the way.
+- **Phase 17**: a real instruction cache (`icache.v`) replacing the
+  always-hit flat fetch array every prior phase relied on, and a Branch
+  Target Buffer (`btb.v`) scoped to non-return indirect JALR prediction
+  (the one class of jump this design still always stalled on); see
+  "Phase 17: instruction cache + BTB" below.
 
 Tests cover RAW/WAR/WAW hazards (including intra-group ones specific to
 2-wide dispatch), a real backward-branch loop (which, as a side effect of
@@ -1813,3 +1856,390 @@ deliverable.
   own top level either, by design, to keep this phase's risk contained to
   `l2_cache.v` itself; a real integration would expose it there and wire
   a real accelerator's cache hierarchy onto it.
+
+## Phase 16: 3-wide superscalar
+
+Phase 3/5 left this core 2-wide end to end (dispatch, CDB, commit), with
+Phase 4's own benchmarking finding that dispatch width alone barely moved
+total cycles until Phase 5 widened the CDB/commit path to match. This
+phase asks, and answers, the natural next question: how much further can
+this specific, scoped design honestly go, and what does it take to get
+there.
+
+### Feasibility: what actually gates IPC here
+
+- `alu_rs.v`/`mul_rs.v`/`lsq.v` each picked and executed exactly **one**
+  ready entry per cycle regardless of dispatch or CDB width -- an
+  artificial cap, not a real one, since ALU/mul compute is purely
+  combinational and "free" to replicate. This is the concrete mechanism
+  behind Phase 4's finding: widening the front end without widening
+  execute/broadcast just moves the queueing earlier, it doesn't remove
+  it.
+- The CDB arbiter (`riscv64_ooo_proc.v`) was already a clean
+  `NREQ`-sized array plus an iterative "find oldest, mask, repeat"
+  reduction, not hand-unrolled pairwise trees -- widening it from 2 picks
+  to 3, and growing its requester list, is mechanical.
+- `rob.v`/`rat.v` already generalized cleanly from 1 port to 2 (alloc/
+  commit/mark/lookup/write/commit-clear all came in ordinary, mechanically
+  -added pairs); a 3rd port is the same pattern applied once more.
+- Two resources are **real, structural** ceilings that adding lanes does
+  not remove: `l1_cache.v`'s primary CPU port is single-outstanding
+  (`cpu_read2` only serves opportunistic hit-under-miss *while the
+  primary port is busy elsewhere*, not a genuine 2nd concurrent fresh
+  load -- see its own Phase 10 header), and store commit shares one
+  write port. Load/store-heavy code stays capped well below 3 IPC
+  regardless of front-end width, the same honest category of limit this
+  project already documents for `div_rs.v`/the data path.
+- Classical ILP results (Wall 1991; the general "Flynn's bottleneck"
+  finding) put sustained IPC for ordinary integer code in the 2-3 range
+  even on much wider real machines, absent large-scale value prediction.
+  **3-wide, with the ALU-issue bottleneck actually removed, is the right
+  stopping point** for this scoped core: it directly fixes what Phase 4/5
+  identified as the real limiter, without requiring a separate, much
+  larger redesign of the L1/L2 bandwidth path.
+
+### What was built
+
+- **`rat.v`/`rob.v`**: a 3rd read/write/commit-clear port and a 3rd
+  alloc/commit/CDB-mark/lookup port respectively, mechanically extending
+  the existing 1→2 pattern to 1→2→3.
+- **`alu_rs.v`**: a 3rd allocation port, **and** a 2nd and 3rd issue pick
+  (`req2`/`req3`), each re-running the same "find oldest ready, mask,
+  repeat" reduction the CDB arbiter already used -- up to 3 independent
+  ALU results can now be produced (and, CDB permitting, broadcast) in a
+  single cycle. This, not just a wider CDB, is what actually cashes in
+  the wider commit path for ALU-heavy code.
+- **`mul_rs.v`/`lsq.v`**: a 3rd allocation port only -- issue stays
+  single-pick (mul is rare enough that a 2nd port isn't worth it, and
+  `lsq.v`'s load throughput is bounded by `l1_cache.v`'s single primary
+  port regardless of issue width anyway).
+- **`div_rs.v`/`branch_rs.v`**: no allocation changes (still exactly 1
+  entry, branch-class still lane-0-only, unchanged since Phase 3) -- just
+  a 3rd CDB snoop bus, matching every other bank.
+- **`riscv64_ooo_proc.v`**: a 3rd fetch/decode lane per thread, an 8-way
+  (was 6-way) CDB arbiter picking 3 winners/cycle via a 3rd reduction
+  pass, 3-wide dispatch resource gating and intra-group RAW forwarding
+  (lane 2 against *both* lane 0 and lane 1), a 3rd register-file write
+  port, and the store/vector commit-conflict arbitration generalized from
+  2 to 3 simultaneous ROB heads (per thread, plus the existing
+  cross-thread single-store-port arbitration).
+- **`ENABLE_TRIPLE_ISSUE`** (new parameter, `riscv64_ooo_proc.v`/
+  `riscv64_ooo_proc_solo.v`): same convention as Phase 4's
+  `ENABLE_DUAL_ISSUE`, **defaults to 1**, and gates only lane 2's own
+  dispatch -- the 3-way ALU issue path, the CDB's 3rd pick, and
+  `commit_req3` all run unconditionally, full-rate, whether or not lane 2
+  itself is firing this cycle. An earlier pass at this phase additionally
+  throttled those three by `ENABLE_TRIPLE_ISSUE` and defaulted the flag
+  to 0, treating a real correctness bug (see "The `ecall`-as-commit-
+  barrier bug" below) as if it were caused by 3-way issue rate itself;
+  once the actual bug was root-caused and fixed, that throttling was
+  removed as unnecessary -- disabling `ENABLE_TRIPLE_ISSUE` now only
+  narrows dispatch back to 2-wide, it no longer changes execute/broadcast/
+  commit timing at all.
+
+### Bugs found and fixed along the way
+
+- **A missing 3rd-CDB-bus same-cycle bypass.** Widening the CDB to 3
+  buses (`cdbA`/`cdbB`/`cdbC`) but only adding the new lane 2's own
+  operand-readiness logic to check all three left lanes 0 and 1's
+  *existing* same-cycle bypass checking only `cdbA`/`cdbB` -- a real
+  correctness gap once a producer could specifically win the CDB's 3rd
+  pick, not just a missed optimization. Fixed by extending lanes 0/1's
+  bypass checks to `cdbC`, mirroring lane 2's own (correct from the
+  start) version.
+- **A latent double-emission bug in `run_branch_free`'s own test
+  epilogue** (`verify/build_tests_ooo.py`): it explicitly appended
+  `li x31, 0xFFFF0000\necall` to the test body *and* `TestBuilder.source()`
+  unconditionally appends the identical sequence again -- harmless at
+  2-wide (the first `ecall` always halts the simulation long before the
+  second copy could matter) but worth fixing regardless of its
+  connection to anything else, since dead, never-meant-to-execute code
+  sitting right after a program's real halt point is a foot-gun for any
+  future speed-up. Fixed by removing the test-body's own redundant copy.
+- **Stale standalone unit testbenches.** `verify/tb_rob_rat.v` and
+  `verify/tb_ecc_rob.v` instantiate `rob.v`/`rat.v` directly, by hand,
+  with an explicit named-port connection for every port that existed
+  *before* this phase. The new ports this phase added (`alloc3_*`,
+  `mark_c_*`, `lookup5/6_*`, `head3_*`, `commit_req3`, `rs1c`/`rs2c`,
+  `write3_en`, `commit_clear_en3`, ...) were simply absent from those
+  connection lists, leaving them floating -- and an unconnected *input*
+  feeding straight into `count`'s own arithmetic (`... + (do_alloc3 ? 1 :
+  0) - ...`) turns "floating" into 4-state `x`, which then contaminates
+  every read of `count` from that point on. This is why both suites
+  went from all-green to mostly-`x`-valued failures the instant these
+  modules' port lists grew -- not a bug in `rob.v`/`rat.v` themselves,
+  but a real reminder that widening a module's interface is only safe
+  once *every* instantiation, including ones a phase's own diff never
+  touches, is re-checked. Fixed by wiring the new ports to the same
+  "inactive"/tied-off values every other never-used port in those
+  testbenches already uses. 21/21 and the ECC ROB suite pass again.
+
+### The `ecall`-as-commit-barrier bug (the race, root-caused)
+
+An earlier pass at this phase found `ecall_halt0` sometimes going high
+one cycle before the register a program's own dependency chain had just
+written was visible, and treated it as a *display-timing* problem --
+registering `ecall_halt0` by one cycle to turn "about to retire" into
+"has retired". That fix was directionally right (an external halt
+observer should only ever see fully-settled, post-edge state) but
+incomplete: registering the signal without also fixing what was allowed
+to *commit* alongside `ecall` just moved the same corruption one cycle
+later and made it deterministic instead of an occasional race, which is
+exactly what surfaced it as a much larger regression (7/36) once this
+phase's throttling gates were removed and full-rate 3-way commit ran
+unthrottled for the first time.
+
+The actual root cause, found by tracing `ooo_branch` cycle-by-cycle with
+a hierarchical-reference debug testbench (dumping every `T0-ALLOC`/
+`T0-MARK*`/`COMMIT head*` event, the same methodology every prior bug in
+this project was root-caused with): fetch never stops or squashes at
+`ecall` -- nothing about `ecall` redirects the PC, so whatever code
+happens to sit immediately after it in the binary (in this project's own
+tests, that's the unreachable `check_eq` fail-handler epilogues sitting
+right after the pass path) is *already* sitting in the ROB as head2/head3
+by the time `ecall` itself reaches head. `commit_req2`/`commit_req3`
+never checked whether an *older* head position was itself the retiring
+`ecall`, so that younger, never-meant-to-execute instruction would commit
+in the exact same cycle as the `ecall` -- observed directly: `x31` was
+correctly written to the pass code by `head`, and then stomped back to 0
+by `head3`'s own fail-handler write, in that same cycle. Fixed at the
+source: `t0_rob_commit_req2`/`t1_rob_commit_req2` now additionally
+require `!head_is_ecall`, and `commit_req3`/`t1_rob_commit_req3` require
+`!head2_is_ecall` -- an `ecall` retiring at any head position is now a
+hard same-cycle commit barrier for every younger position, matching how
+a real halt/trap should behave regardless of issue width. With this fix,
+the previously-reverted registered-`ecall_halt0` change is correct and
+necessary (there is no longer anything left for it to race against), so
+both fixes ship together.
+
+### A 3rd-lane dispatch resource-gating deadlock
+
+Found the same way, tracing `smt_t0_collide+smt_t1_collide` (two threads
+both flooding 8 independent, immediately-ready adds through the shared
+`alu_rs`) after the `ecall` fix alone wasn't enough to get it past a
+20000-cycle timeout. `lane2_alu_ok`/`lane2_mul_ok`/`lane2_lsq_ok` picked
+between each bank's `has_2_free`/`has_3_free`/`!full` outputs by a static
+case on "does lane 0 and/or lane 1 also want this bank" -- but
+`has_3_free` is *already*, by construction, exactly "given lane 0's and
+lane 1's real `alloc_req`/`alloc2_req` this cycle, is there room for a
+3rd" (its own free-slot search only excludes a slot if the corresponding
+earlier `alloc_req` genuinely fires -- see `alu_rs.v`'s own comments), so
+it silently gives the right answer in every case on its own. Routing
+through `has_2_free` instead whenever *only* lane 1 (not lane 0) wanted
+the bank was actively wrong: `has_2_free`'s exclusion is keyed off
+`alloc_req` (lane 0) alone, so with `alloc_req=0` it degenerates to "any
+1 free slot", not the 2 slots actually needed for lane 1 *and* lane 2.
+ROB/RAT dispatch would proceed believing lane 2 got a reservation-station
+entry (the ROB tag exists, the RAT rename landed) while `alu_rs.v`'s own
+real `do_alloc3 = alloc3_req && have_free3` check found no room and
+silently dropped it -- a permanent deadlock on a ROB tag nothing was ever
+going to broadcast, confirmed directly: the stuck ROB head's tag never
+appeared in `alu_rs`'s per-slot dump at all, live or otherwise. Fixed by
+simplifying all three checks to `!d2_is_<bank> || <bank>_has_3_free`
+unconditionally -- `has_3_free` alone already covers every combination of
+what lanes 0/1 want, so the ternary was both redundant and, in exactly
+this one case, wrong.
+
+### Verification
+
+`ENABLE_TRIPLE_ISSUE=1` (the default, full-rate, no throttling): all
+36/36 single-core tests pass, matching the pre-Phase-16 baseline exactly
+while genuinely issuing/broadcasting/committing up to 3/cycle; the
+ROB+RAT (21/21) and ECC ROB standalone unit suites both pass;
+`div_fu.v`/`ecc64.v`/`ecc_line.v` standalone suites (untouched by this
+phase) still pass, confirmed directly rather than assumed. The 3-way ALU
+issue path was directly confirmed producing and correctly broadcasting 3
+independent results in a single cycle (traced via `alu_rs.v`'s internal
+per-slot state, not just inferred from final register values). The full
+design (all Phase 1-16 RTL, `riscv64_ooo_proc.v`/`_solo.v` included)
+compiles clean with Icarus Verilog (`iverilog -g2012`), no warnings.
+`ENABLE_TRIPLE_ISSUE=0` still works as a pure dispatch-width knob (2-wide
+front end, same full-rate 3-way execute/broadcast/commit machinery
+underneath, since that path is no longer gated by the flag at all) for
+anyone who wants to isolate front-end width from execute width in future
+benchmarking.
+
+## Phase 17: instruction cache + BTB
+
+Every prior phase's fetch stage read from an always-hit, 1-cycle,
+`$readmemh`-loaded flat array (`instruction_fetch.v`/
+`instruction_fetch_reg.v`) — functionally fine for correctness, but not a
+cache in any real sense, and this design had no branch *target* predictor
+at all (`bht.v` only ever predicted taken/not-taken direction). This
+phase adds both, asked directly: does this core have an instruction
+cache, and can a BTB be added.
+
+### Design decisions
+
+- **The instruction cache is per-thread-private, with no coherency.**
+  Unlike the data path's genuinely shared, MESI-coherent `l2_cache.v`,
+  this core's instruction memory is *already* per-thread-private —
+  `IMEM_FILE0`/`IMEM_FILE1` are literally different program images per
+  thread in every test. `icache.v` therefore needs no snoop port, no L2
+  integration, nothing shared across threads or cores — a private
+  structure per thread, matching how instruction memory already worked
+  here. No self-modifying-code protection exists anywhere in this
+  codebase, and none is added — a documented scope cut, the same
+  convention `l1_cache.v`'s own single primary port already established.
+- **Hit latency stays exactly 1 cycle**, matching the modules it
+  replaces, so Phase 11's existing `t0_pc_latched`/`t0_fetch_valid`
+  plumbing (built assuming fetch is always 1-cycle) needed *zero*
+  changes for the hit case — only a miss needed new stall handling, via
+  one new `stall` output per thread, registered the same edge as
+  `t0_fetch_valid` so it describes "was the fetch that's now visible
+  actually valid," the identical convention.
+- **The backing store reuses `instruction_fetch_reg.v` wholesale**,
+  rather than reinventing a `$readmemh` array, via the same "N parallel
+  instances = N read ports" trick this file already uses for its 3 fetch
+  lanes, scaled to `LINE_BYTES/4` (8 at defaults) instances covering one
+  whole line at once. This preserves Phase 12's AXI-loadable capability
+  for free — `instruction_fetch_axi.v`/`axi_ooo_ctrl.v`/`fpga_top.v`
+  needed zero changes, confirmed by inspection, not assumed, since they
+  only ever talk to `riscv64_ooo_proc.v`'s `t0_imem_axi_wr_*` ports,
+  whose shape never changed. `MISS_LATENCY` (default 4) is a separate,
+  purely artificial wait-cycle count layered on top, whose only job is
+  to make a miss genuinely cost more than a hit — the backing store
+  itself is otherwise instant, so without this a "cache" would have
+  nothing real to cache.
+- **Line-boundary crossing is handled conservatively.** The 3-wide fetch
+  group spans up to 12 bytes; with the default 32-byte line, roughly a
+  third of alignments spill the 3rd lane into the next line. v1 policy:
+  every lane stalls together until *every* line the group needs is
+  resident — no partial-width degraded fetch. Only `line(pc)` and
+  `line(pc2)` are ever checked; `line(pc1)` is always provably covered by
+  one of those two (`pc1` can only leave `line(pc)` at the line's last
+  word, and at that exact offset `pc2` has already crossed into the same
+  next line `pc1` did).
+- **The BTB is scoped to non-return indirect JALR, not conditional
+  branches.** RV64I conditional-branch targets are `pc+imm` — already a
+  cheap, immediate, same-cycle decode-time computation; a BTB adds
+  nothing there. The real gap was non-return JALR (computed calls,
+  virtual dispatch, switch/jump tables): `branch_rs.v`'s own header had
+  documented since Phase 2 that JALR "stays on the old stall-until-
+  resolved path... no BTB in this scope to predict it" — this phase is
+  exactly that scope arriving. `ras.v` already predicts the return-shaped
+  case; everything else always stalled fetch completely with zero
+  prediction until now.
+- **BTB predictions reuse 100% of the existing RAS/mispredict/recovery
+  machinery.** `t0_mispredict`'s compare (`t0_spec_is_jalr ?
+  resolved_next_pc != t0_predicted_target_reg : ...`) was already generic
+  over *how* `t0_predicted_target_reg` got set — a BTB prediction just
+  became a new way of populating that same register, alongside RAS. RAT
+  checkpoint, ROB squash, and all 4 RS-bank squash needed zero changes.
+  Table itself: no tags, single shared instance across threads — same
+  aliasing-accepted simplicity convention `bht.v` already established
+  (documented, not a correctness risk, since any misprediction from any
+  source is caught and recovered identically either way).
+
+### What was built
+
+- **`icache.v`** (new): direct-mapped, read-only, one instance per
+  thread, serving all 3 fetch-group addresses from one shared tag/valid/
+  line structure via combinational compares (the same "multiple read
+  ports into one array is trivial for a read-only structure" instinct
+  `l1_cache.v`'s own `cpu_read2_*` port already established). A 2-state
+  fill FSM (`ST_IDLE`/`ST_FILL_WAIT` — no 3rd "done" state needed, since
+  the top level just keeps re-presenting the held PC every stall cycle
+  until a combinational re-check naturally hits) drives the 8 parallel
+  `instruction_fetch_reg` "read ports" described above. Like `div_fu.v`
+  (see `div_rs.v`'s identical precedent), the fill FSM has no abort
+  input — a redirect arriving mid-fill for an already-abandoned
+  speculative-path line just lets that fill finish harmlessly before the
+  *next* miss (for the redirect's own target, if needed) can even be
+  detected; a pure latency interaction, not a correctness gap, and
+  documented as such in the module's own header.
+- **`btb.v`** (new): a 64-entry, no-tag, PC-indexed table (`valid[]`/
+  `target[]`), structurally identical in spirit to `bht.v` — unconditional
+  overwrite on every training update, no confirm/deny logic.
+- **`riscv64_ooo_proc.v`**: each thread's 3× `instruction_fetch_reg`
+  instances replaced by one `icache` instance; a new `t0_icache_stall`/
+  `t1_icache_stall` pair ANDed into `lane0_fire` exactly like the
+  existing `!jalr_stall_active` term (PC-hold during a stall needed no
+  new logic — it already fell out for free from `lane0_fire` gating low,
+  the same mechanism `jalr_stall_active` already relied on). A new `btb_i`
+  instance reads the same muxed, latched `pc` `bht_i` already does;
+  `t0_btb_predict_req`/`t1_btb_predict_req` fire for
+  `d0_is_jalr && !t0_ras_pop_req && btb_predict_valid` — keyed on
+  `!t0_ras_pop_req`, not `!ras_pop_it`, which also gets free BTB coverage
+  for the RAS-present-but-empty fallback case (deep/mismatched call
+  nesting past `RAS_DEPTH`) at no extra cost. A new `t0_spec_src_is_btb`
+  register (RAS and BTB predictions both set `t0_spec_is_jalr=1`, so this
+  second bit is needed at *training* time to tell them apart — genuine
+  misprediction *detection* needed no such distinction, already generic)
+  gates `t0_btb_train_valid`, which trains on every resolved non-RAS JALR
+  — both a BTB hit getting confirmed/denied and a previously-cold-stalled
+  one. `t0_jalr_stall_active`'s arming condition gained `&&
+  !t0_btb_predict_req`; `t0_rat_checkpoint_save` gained `||
+  t0_btb_predict_req`; the `t0_next_pc` priority mux gained one new branch
+  (`else if (t0_btb_predict_req) t0_next_pc = btb_predict_target;`)
+  between the existing RAS-pop branch and the straight-line fallthrough.
+  All mirrored for thread 1.
+- **`verify/build_tests_ooo.py`**: `icache.v`/`btb.v` added to `OOO_RTL`;
+  two new dedicated tests, `ooo_btb_indirect_call` and
+  `ooo_btb_misprediction` (see Verification below). `ooo_div_overlap`'s
+  cycle-count ceiling was bumped from 200 to 230 to absorb the real, honest
+  few-cycle cost of that short program's cold instruction lines now
+  actually costing something to fetch the first time — still a small
+  fraction of the much larger regression signature (an add serialized
+  behind a full divide latency) that ceiling actually exists to catch.
+- **`verify/tb_icache.v`, `verify/tb_btb.v`** (new): standalone unit
+  testbenches, direct hierarchical-instantiation style matching
+  `tb_rob_rat.v`. `tb_icache.v` covers cold miss+fill, warm repeated hit
+  (1-cycle latency confirmed cycle-by-cycle), line-boundary-crossing
+  misses (both the "one line already resident" and "neither line
+  resident" cases), and direct-mapped eviction/overwrite, against a
+  small, self-describing fixture (`verify/icache_test.mem`, where the
+  32-bit word at byte address A holds the value A itself, so a correct
+  read is trivially checked against the address it came from).
+  `tb_btb.v` covers cold miss, train-then-hit, retrain/overwrite, PC
+  aliasing, and reset clearing every trained entry.
+
+### Verification
+
+All 36 pre-existing single-core tests pass unchanged with the real
+`icache.v`/`btb.v` now the default (not an opt-in flag) — confirming the
+cache/BTB genuinely don't change architectural behavior, only timing.
+Two new dedicated tests were added and directly, not just inferentially,
+confirmed to exercise the new hardware: `ooo_btb_indirect_call` (a
+non-return indirect JALR through the same target, executed twice via a
+real backward-branch loop — the same static `jalr` instruction resolved
+twice) and `ooo_btb_misprediction` (the same shape, but the target
+genuinely changes between the two visits). A one-off hierarchical trace
+of `ooo_btb_misprediction` confirmed the full intended lifecycle
+directly: `t0_btb_train_valid` fires after visit 1 resolves (training the
+table on `jt_a`'s address), `t0_btb_predict_req` fires on visit 2's
+dispatch of the *same* `jalr` (a real speculative redirect, not a stall),
+and `t0_mispredict` fires with `t0_spec_src_is_btb=1` when visit 2's real
+target (`jt_b`) turns out to differ — with final architectural state
+still correct, proving the existing RAS-proven recovery machinery handles
+a BTB-sourced misprediction identically. `tb_icache.v` (12 checks) and
+`tb_btb.v` (8 checks) both pass standalone. `tb_rob_rat.v` (21/21) and
+`tb_ecc_rob.v` remain unaffected. The 2-core MESI coherency test
+(`build_dual_core_tests.py`) still passes unmodified, confirming
+icache/BTB are genuinely fetch-side-private with no coherency
+interaction. `bench_ooo.py` runs clean with the new, realistic fetch
+latency now included in every measured cycle count. The full design
+compiles clean with Icarus Verilog (`iverilog -g2012`), no warnings.
+Unlike Phase 16, no RTL correctness bugs were found during this phase's
+integration — both the icache-alone and icache+BTB regression passes
+went green on the first try (aside from the expected, legitimate
+`ooo_div_overlap` ceiling adjustment above), attributed to the two-round
+research-then-plan-validation process this phase's design went through
+before any RTL was written, catching the trickiest issues (the exact
+`t0_next_pc` mux insertion point, the registered-vs-combinational hit
+timing, the `line(pc1)` coverage proof, the `!t0_ras_pop_req` vs.
+`!ras_pop_it` distinction) on paper rather than in simulation.
+
+The redirect-arriving-mid-fill interaction (documented in `icache.v`'s
+header) was reasoned through rather than exercised by a dedicated,
+precisely-timed test — constructing one deterministically would require
+hand-aligning a mispredict's resolution cycle against an in-flight fill's
+exact `MISS_LATENCY` countdown, which is fragile to hand-craft and easy
+to invalidate with any future timing change elsewhere in the pipeline.
+Left as a documented, reasoned-about (not directly, dedicatedly tested)
+interaction rather than a false sense of coverage from a test that would
+silently stop exercising the intended timing window the moment any
+unrelated latency shifts by even one cycle; the existing, already
+branch/mispredict-heavy regression suite runs entirely with real icache
+latency active and passes throughout, which is real (if indirect)
+evidence against a live bug there.

@@ -66,6 +66,18 @@ module rob #(
     output [$clog2(DEPTH)-1:0] alloc2_tag,
     output [$clog2(DEPTH):0] free_count,   // 0..DEPTH
 
+    // Phase 16: a third, lane-2 (youngest) allocation port for 3-wide
+    // dispatch, same convention as alloc2 -- alloc3_tag = alloc_tag+2
+    // combinationally, always valid to read, only consumed if alloc3_req
+    // fires and free_count is >=3 this cycle.
+    input alloc3_req,
+    input alloc3_has_dest,
+    input [4:0] alloc3_rd,
+    input alloc3_is_store,
+    input alloc3_is_ecall,
+    input alloc3_is_vec_dest,
+    output [$clog2(DEPTH)-1:0] alloc3_tag,
+
     // Mark an entry's result ready: a CDB broadcast for a register-
     // producing entry (mark_value is the result), or the LSQ signaling a
     // store's address+data are both known (mark_value don't-care --
@@ -98,6 +110,15 @@ module rob #(
     input mark_b_valid,
     input [$clog2(DEPTH)-1:0] mark_b_tag,
     input [63:0] mark_b_value,
+
+    // Phase 16: a third CDB-sourced mark port, exactly mirroring
+    // mark_valid/mark_b_valid, for the top level's 3-wide CDB arbiter's
+    // third simultaneous winner. Safe without arbitration for the same
+    // reason mark_b already is: the three winning requesters always carry
+    // distinct ROB tags.
+    input mark_c_valid,
+    input [$clog2(DEPTH)-1:0] mark_c_tag,
+    input [63:0] mark_c_value,
 
     // Phase 6: vector-result mark port -- exactly mark_valid's role, but
     // writing vec_value_arr (VLEN bits) instead of value_arr (64 bits).
@@ -167,6 +188,15 @@ module rob #(
     output lookup4_done,
     output [63:0] lookup4_value,
 
+    // Phase 16: two more lookup ports, same convention, for lane 2's own
+    // rs1/rs2 readiness determination (3-wide dispatch).
+    input [$clog2(DEPTH)-1:0] lookup5_tag,
+    output lookup5_done,
+    output [63:0] lookup5_value,
+    input [$clog2(DEPTH)-1:0] lookup6_tag,
+    output lookup6_done,
+    output [63:0] lookup6_value,
+
     // Phase 6: two more lookup ports, same convention, reading
     // vec_value_arr (VLEN bits) instead of value_arr -- for vec_rat's
     // own dispatch-time operand readiness (vs1/vs2), which needs the
@@ -213,6 +243,23 @@ module rob #(
     output head2_is_ecall,
     input commit_req2,
 
+    // Phase 16: a third commit port for the head+2 entry, retiring
+    // alongside head and head2 in the same cycle (3-wide commit). Same
+    // defensive convention as head2_ready: additionally requires count>=3,
+    // and this module requires do_commit2 (head+1 itself retiring) before
+    // ever acting on commit_req3 -- head+2 can never retire ahead of
+    // head+1, same in-order enforcement head2 already gives head.
+    output head3_ready,
+    output [$clog2(DEPTH)-1:0] head3_tag,
+    output head3_has_dest,
+    output [4:0] head3_rd,
+    output [63:0] head3_value,
+    output [VLEN-1:0] head3_vec_value,
+    output head3_is_vec_dest,
+    output head3_is_store,
+    output head3_is_ecall,
+    input commit_req3,
+
     // Phase 9 (ECC): protects only value_arr[] (the scalar payload that
     // ultimately becomes committed architectural register state), not
     // vec_value_arr[] -- consistent with vector's already-narrower,
@@ -245,6 +292,7 @@ module rob #(
     assign empty = (count == 0);
     assign alloc_tag  = tail_ptr;
     assign alloc2_tag = tail_ptr + 1'b1;
+    assign alloc3_tag = tail_ptr + 2'd2;
     assign free_count = DEPTH - count;
 
     assign head_ready     = !empty && done_arr[head_ptr];
@@ -266,10 +314,22 @@ module rob #(
     assign head2_is_store   = is_store_arr[head2_ptr];
     assign head2_is_ecall   = is_ecall_arr[head2_ptr];
 
+    wire [TB-1:0] head3_ptr = head_ptr + 2'd2;
+    assign head3_ready     = (count >= 3) && done_arr[head3_ptr];
+    assign head3_tag        = head3_ptr;
+    assign head3_has_dest   = has_dest_arr[head3_ptr];
+    assign head3_rd         = rd_arr[head3_ptr];
+    assign head3_vec_value  = vec_value_arr[head3_ptr];
+    assign head3_is_vec_dest = is_vec_dest_arr[head3_ptr];
+    assign head3_is_store   = is_store_arr[head3_ptr];
+    assign head3_is_ecall   = is_ecall_arr[head3_ptr];
+
     assign lookup1_done  = done_arr[lookup1_tag];
     assign lookup2_done  = done_arr[lookup2_tag];
     assign lookup3_done  = done_arr[lookup3_tag];
     assign lookup4_done  = done_arr[lookup4_tag];
+    assign lookup5_done  = done_arr[lookup5_tag];
+    assign lookup6_done  = done_arr[lookup6_tag];
 
     // ---- Phase 9 (ECC): one decode instance per read port. Correction
     // is applied on every one of them (lookup1-4 included -- a
@@ -288,12 +348,16 @@ module rob #(
     // reporting noise from an untouched, don't-care-value tag as if it
     // were a real fault.
     wire [63:0] lookup1_corrected, lookup2_corrected, lookup3_corrected, lookup4_corrected;
+    wire [63:0] lookup5_corrected, lookup6_corrected;
     wire lookup1_sbe, lookup1_dbe, lookup2_sbe, lookup2_dbe;
     wire lookup3_sbe, lookup3_dbe, lookup4_sbe, lookup4_dbe;
+    wire lookup5_sbe, lookup5_dbe, lookup6_sbe, lookup6_dbe;
     assign lookup1_value = lookup1_corrected;
     assign lookup2_value = lookup2_corrected;
     assign lookup3_value = lookup3_corrected;
     assign lookup4_value = lookup4_corrected;
+    assign lookup5_value = lookup5_corrected;
+    assign lookup6_value = lookup6_corrected;
     ecc64 ecc_lookup1_i (.wr_data(64'b0), .wr_check(),
         .rd_data(value_arr[lookup1_tag]), .rd_check(value_check[lookup1_tag]),
         .rd_data_corrected(lookup1_corrected), .rd_sbe(lookup1_sbe), .rd_dbe(lookup1_dbe));
@@ -306,27 +370,40 @@ module rob #(
     ecc64 ecc_lookup4_i (.wr_data(64'b0), .wr_check(),
         .rd_data(value_arr[lookup4_tag]), .rd_check(value_check[lookup4_tag]),
         .rd_data_corrected(lookup4_corrected), .rd_sbe(lookup4_sbe), .rd_dbe(lookup4_dbe));
+    ecc64 ecc_lookup5_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[lookup5_tag]), .rd_check(value_check[lookup5_tag]),
+        .rd_data_corrected(lookup5_corrected), .rd_sbe(lookup5_sbe), .rd_dbe(lookup5_dbe));
+    ecc64 ecc_lookup6_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[lookup6_tag]), .rd_check(value_check[lookup6_tag]),
+        .rd_data_corrected(lookup6_corrected), .rd_sbe(lookup6_sbe), .rd_dbe(lookup6_dbe));
 
-    wire [63:0] head_corrected, head2_corrected;
-    wire head_val_sbe, head_val_dbe, head2_val_sbe, head2_val_dbe;
+    wire [63:0] head_corrected, head2_corrected, head3_corrected;
+    wire head_val_sbe, head_val_dbe, head2_val_sbe, head2_val_dbe, head3_val_sbe, head3_val_dbe;
     assign head_value  = head_corrected;
     assign head2_value = head2_corrected;
+    assign head3_value = head3_corrected;
     ecc64 ecc_head_i (.wr_data(64'b0), .wr_check(),
         .rd_data(value_arr[head_ptr]), .rd_check(value_check[head_ptr]),
         .rd_data_corrected(head_corrected), .rd_sbe(head_val_sbe), .rd_dbe(head_val_dbe));
     ecc64 ecc_head2_i (.wr_data(64'b0), .wr_check(),
         .rd_data(value_arr[head2_ptr]), .rd_check(value_check[head2_ptr]),
         .rd_data_corrected(head2_corrected), .rd_sbe(head2_val_sbe), .rd_dbe(head2_val_dbe));
+    ecc64 ecc_head3_i (.wr_data(64'b0), .wr_check(),
+        .rd_data(value_arr[head3_ptr]), .rd_check(value_check[head3_ptr]),
+        .rd_data_corrected(head3_corrected), .rd_sbe(head3_val_sbe), .rd_dbe(head3_val_dbe));
 
-    assign ecc_rob_sbe_fault = (head_ready && head_val_sbe) || (head2_ready && head2_val_sbe);
-    assign ecc_rob_dbe_fault = (head_ready && head_val_dbe) || (head2_ready && head2_val_dbe);
+    assign ecc_rob_sbe_fault = (head_ready && head_val_sbe) || (head2_ready && head2_val_sbe) || (head3_ready && head3_val_sbe);
+    assign ecc_rob_dbe_fault = (head_ready && head_val_dbe) || (head2_ready && head2_val_dbe) || (head3_ready && head3_val_dbe);
 
-    // ---- Phase 9 (ECC): encode instances for the two scalar CDB mark
-    // ports (mark_valid/mark_b_valid) -- the only writers of value_arr.
-    wire [7:0] mark_check, mark_b_check;
+    // ---- Phase 9 (ECC): encode instances for the scalar CDB mark ports
+    // (mark_valid/mark_b_valid/mark_c_valid) -- the only writers of
+    // value_arr.
+    wire [7:0] mark_check, mark_b_check, mark_c_check;
     ecc64 ecc_mark_i   (.wr_data(mark_value),   .wr_check(mark_check),
         .rd_data(64'b0), .rd_check(8'b0), .rd_data_corrected(), .rd_sbe(), .rd_dbe());
     ecc64 ecc_mark_b_i (.wr_data(mark_b_value), .wr_check(mark_b_check),
+        .rd_data(64'b0), .rd_check(8'b0), .rd_data_corrected(), .rd_sbe(), .rd_dbe());
+    ecc64 ecc_mark_c_i (.wr_data(mark_c_value), .wr_check(mark_c_check),
         .rd_data(64'b0), .rd_check(8'b0), .rd_data_corrected(), .rd_sbe(), .rd_dbe());
 
     assign vec_lookup1_done  = done_arr[vec_lookup1_tag];
@@ -340,11 +417,13 @@ module rob #(
     // double-checks before actually writing.
     wire do_alloc1 = alloc_req  && (free_count >= 1);
     wire do_alloc2 = alloc2_req && (free_count >= 2);
+    wire do_alloc3 = alloc3_req && (free_count >= 3);
 
     // Same defensive convention for commit: do_commit2 additionally
     // requires do_commit1 (see head2_ready's own port comment).
     wire do_commit1 = commit_req  && head_ready;
     wire do_commit2 = commit_req2 && head2_ready && do_commit1;
+    wire do_commit3 = commit_req3 && head3_ready && do_commit2;
 
     integer i;
     always @(posedge clk or posedge reset) begin
@@ -388,7 +467,16 @@ module rob #(
                     is_store_arr[tail_ptr + 1'b1]  <= alloc2_is_store;
                     is_ecall_arr[tail_ptr + 1'b1]  <= alloc2_is_ecall;
                 end
-                tail_ptr <= tail_ptr + (do_alloc1 ? 1'b1 : 1'b0) + (do_alloc2 ? 1'b1 : 1'b0);
+                if (do_alloc3) begin
+                    valid_arr[tail_ptr + 2'd2]     <= 1'b1;
+                    done_arr[tail_ptr + 2'd2]      <= 1'b0;
+                    has_dest_arr[tail_ptr + 2'd2]  <= alloc3_has_dest;
+                    rd_arr[tail_ptr + 2'd2]        <= alloc3_rd;
+                    is_vec_dest_arr[tail_ptr + 2'd2] <= alloc3_is_vec_dest;
+                    is_store_arr[tail_ptr + 2'd2]  <= alloc3_is_store;
+                    is_ecall_arr[tail_ptr + 2'd2]  <= alloc3_is_ecall;
+                end
+                tail_ptr <= tail_ptr + (do_alloc1 ? 1'b1 : 1'b0) + (do_alloc2 ? 1'b1 : 1'b0) + (do_alloc3 ? 1'b1 : 1'b0);
             end
             if (do_commit1) begin
                 valid_arr[head_ptr] <= 1'b0;
@@ -396,7 +484,10 @@ module rob #(
             if (do_commit2) begin
                 valid_arr[head2_ptr] <= 1'b0;
             end
-            head_ptr <= head_ptr + (do_commit1 ? 1'b1 : 1'b0) + (do_commit2 ? 1'b1 : 1'b0);
+            if (do_commit3) begin
+                valid_arr[head3_ptr] <= 1'b0;
+            end
+            head_ptr <= head_ptr + (do_commit1 ? 1'b1 : 1'b0) + (do_commit2 ? 1'b1 : 1'b0) + (do_commit3 ? 1'b1 : 1'b0);
             if (squash_valid) begin
                 // squash_tag is always within [head_ptr, head_ptr+count),
                 // so (squash_tag - head_ptr) is a safe, non-negative
@@ -404,10 +495,10 @@ module rob #(
                 // own (kept) entry, then -1 more per unrelated older entry
                 // *also* retiring the head(s) this same cycle.
                 count <= {1'b0, (squash_tag - head_ptr)} + 1'b1
-                               - (do_commit1 ? 1'b1 : 1'b0) - (do_commit2 ? 1'b1 : 1'b0);
+                               - (do_commit1 ? 1'b1 : 1'b0) - (do_commit2 ? 1'b1 : 1'b0) - (do_commit3 ? 1'b1 : 1'b0);
             end else begin
-                count <= count + (do_alloc1 ? 1'b1 : 1'b0) + (do_alloc2 ? 1'b1 : 1'b0)
-                               - (do_commit1 ? 1'b1 : 1'b0) - (do_commit2 ? 1'b1 : 1'b0);
+                count <= count + (do_alloc1 ? 1'b1 : 1'b0) + (do_alloc2 ? 1'b1 : 1'b0) + (do_alloc3 ? 1'b1 : 1'b0)
+                               - (do_commit1 ? 1'b1 : 1'b0) - (do_commit2 ? 1'b1 : 1'b0) - (do_commit3 ? 1'b1 : 1'b0);
             end
 
             // mark_valid/mark2_valid are independent of alloc/commit and
@@ -416,11 +507,12 @@ module rob #(
             // can't have a result the same cycle it's created; commit's
             // tag is being freed, not marked), so there's no same-cycle
             // ordering dependency to worry about here, unlike rat.v's
-            // write_en vs commit_clear_en interaction. mark_valid and
-            // mark2_valid can fire in the same cycle for two different
-            // tags safely (always distinct, by the ROB's own allocation
-            // invariant) -- that's the whole reason mark2 exists as a
-            // genuinely separate port instead of something arbitrated.
+            // write_en vs commit_clear_en interaction. mark_valid,
+            // mark_b_valid and mark_c_valid can fire in the same cycle for
+            // three different tags safely (always distinct, by the ROB's
+            // own allocation invariant) -- that's the whole reason mark_b/
+            // mark_c exist as genuinely separate ports instead of
+            // something arbitrated.
             if (mark_valid) begin
                 done_arr[mark_tag]  <= 1'b1;
                 value_arr[mark_tag] <= mark_value;
@@ -430,6 +522,11 @@ module rob #(
                 done_arr[mark_b_tag]  <= 1'b1;
                 value_arr[mark_b_tag] <= mark_b_value;
                 value_check[mark_b_tag] <= mark_b_check;
+            end
+            if (mark_c_valid) begin
+                done_arr[mark_c_tag]  <= 1'b1;
+                value_arr[mark_c_tag] <= mark_c_value;
+                value_check[mark_c_tag] <= mark_c_check;
             end
             if (vec_mark_valid) begin
                 done_arr[vec_mark_tag]      <= 1'b1;

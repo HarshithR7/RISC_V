@@ -24,12 +24,18 @@ module riscv64_ooo_proc_solo #(
     parameter MUL_RS_DEPTH = 2,
     parameter LSQ_DEPTH = 4,
     parameter ENABLE_DUAL_ISSUE = 1,
+    parameter ENABLE_TRIPLE_ISSUE = 1,
     parameter LANES = 4,
     parameter VEC_RS_DEPTH = 2,
     parameter L1_LINES = 16,
     parameter L1_LINE_BYTES = 32,
     parameter SBUF_DEPTH = 4,
-    parameter L2_LINES = 64
+    parameter L2_LINES = 64,
+    // Phase 17: see icache.v's own header -- forwarded for tunability,
+    // same convention as L1_LINES/L1_LINE_BYTES above.
+    parameter ICACHE_LINES = 16,
+    parameter ICACHE_LINE_BYTES = 32,
+    parameter ICACHE_MISS_LATENCY = 4
 )(
     input clk,
     input reset,
@@ -49,9 +55,10 @@ module riscv64_ooo_proc_solo #(
     riscv64_ooo_proc #(
         .IMEM_FILE0(IMEM_FILE0), .IMEM_FILE1(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS),
         .ROB_DEPTH(ROB_DEPTH), .ALU_RS_DEPTH(ALU_RS_DEPTH), .MUL_RS_DEPTH(MUL_RS_DEPTH),
-        .LSQ_DEPTH(LSQ_DEPTH), .ENABLE_DUAL_ISSUE(ENABLE_DUAL_ISSUE), .LANES(LANES),
+        .LSQ_DEPTH(LSQ_DEPTH), .ENABLE_DUAL_ISSUE(ENABLE_DUAL_ISSUE), .ENABLE_TRIPLE_ISSUE(ENABLE_TRIPLE_ISSUE), .LANES(LANES),
         .VEC_RS_DEPTH(VEC_RS_DEPTH), .L1_LINES(L1_LINES), .L1_LINE_BYTES(L1_LINE_BYTES),
-        .SBUF_DEPTH(SBUF_DEPTH)
+        .SBUF_DEPTH(SBUF_DEPTH),
+        .ICACHE_LINES(ICACHE_LINES), .ICACHE_LINE_BYTES(ICACHE_LINE_BYTES), .ICACHE_MISS_LATENCY(ICACHE_MISS_LATENCY)
     ) core (
         .clk(clk), .reset(reset),
         .pc_out0(pc_out0), .pc_out1(pc_out1),

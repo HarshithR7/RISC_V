@@ -28,10 +28,11 @@ module div_rs #(
     input [TAG_BITS-1:0] alloc_dest_tag,
     output full,
 
-    // Two independent CDB snoop buses -- see alu_rs.v's identical port,
-    // including cdbA_tid/cdbB_tid (Phase 7 fix: ROB tags are only unique
-    // per-thread, so snoop matching must compare the full (tid,tag) pair,
-    // not the tag alone).
+    // Three independent CDB snoop buses (Phase 16 widens this from two to
+    // three) -- see alu_rs.v's identical port, including cdbA_tid/
+    // cdbB_tid/cdbC_tid (Phase 7 fix: ROB tags are only unique per-thread,
+    // so snoop matching must compare the full (tid,tag) pair, not the tag
+    // alone).
     input cdbA_valid,
     input cdbA_tid,
     input [TAG_BITS-1:0] cdbA_tag,
@@ -40,6 +41,10 @@ module div_rs #(
     input cdbB_tid,
     input [TAG_BITS-1:0] cdbB_tag,
     input [63:0] cdbB_value,
+    input cdbC_valid,
+    input cdbC_tid,
+    input [TAG_BITS-1:0] cdbC_tag,
+    input [63:0] cdbC_value,
 
     output req_valid,
     output req_tid,
@@ -117,11 +122,15 @@ module div_rs #(
                 s1_ready <= 1'b1; s1_val <= cdbA_value;
             end else if (busy && !s1_ready && cdbB_valid && tid_r == cdbB_tid && s1_tag == cdbB_tag) begin
                 s1_ready <= 1'b1; s1_val <= cdbB_value;
+            end else if (busy && !s1_ready && cdbC_valid && tid_r == cdbC_tid && s1_tag == cdbC_tag) begin
+                s1_ready <= 1'b1; s1_val <= cdbC_value;
             end
             if (busy && !s2_ready && cdbA_valid && tid_r == cdbA_tid && s2_tag == cdbA_tag) begin
                 s2_ready <= 1'b1; s2_val <= cdbA_value;
             end else if (busy && !s2_ready && cdbB_valid && tid_r == cdbB_tid && s2_tag == cdbB_tag) begin
                 s2_ready <= 1'b1; s2_val <= cdbB_value;
+            end else if (busy && !s2_ready && cdbC_valid && tid_r == cdbC_tid && s2_tag == cdbC_tag) begin
+                s2_ready <= 1'b1; s2_val <= cdbC_value;
             end
 
             if (alloc_req && !busy) begin

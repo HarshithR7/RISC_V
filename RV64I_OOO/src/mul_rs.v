@@ -44,10 +44,29 @@ module mul_rs #(
     input [TAG_BITS-1:0] alloc2_dest_tag,
     output has_2_free,
 
-    // Two independent CDB snoop buses -- see alu_rs.v's identical port,
-    // including cdbA_tid/cdbB_tid (Phase 7 fix: ROB tags are only unique
-    // per-thread, so snoop matching must compare the full (tid,tag) pair,
-    // not the tag alone).
+    // Phase 16: a third allocation port, lane 2 of 3-wide dispatch --
+    // same convention as alu_rs.v's alloc3 (issue itself stays single-pick
+    // per cycle here; only ALU got a wider issue path -- see this
+    // project's README, Phase 16 section, for why multiply didn't need
+    // the same treatment).
+    input alloc3_req,
+    input alloc3_tid,
+    input [2:0] alloc3_op,
+    input alloc3_word_op,
+    input alloc3_src1_ready,
+    input [63:0] alloc3_src1_val,
+    input [TAG_BITS-1:0] alloc3_src1_tag,
+    input alloc3_src2_ready,
+    input [63:0] alloc3_src2_val,
+    input [TAG_BITS-1:0] alloc3_src2_tag,
+    input [TAG_BITS-1:0] alloc3_dest_tag,
+    output has_3_free,
+
+    // Three independent CDB snoop buses (Phase 16 widens this from two to
+    // three) -- see alu_rs.v's identical port, including cdbA_tid/
+    // cdbB_tid/cdbC_tid (Phase 7 fix: ROB tags are only unique per-thread,
+    // so snoop matching must compare the full (tid,tag) pair, not the tag
+    // alone).
     input cdbA_valid,
     input cdbA_tid,
     input [TAG_BITS-1:0] cdbA_tag,
@@ -56,6 +75,10 @@ module mul_rs #(
     input cdbB_tid,
     input [TAG_BITS-1:0] cdbB_tag,
     input [63:0] cdbB_value,
+    input cdbC_valid,
+    input cdbC_tid,
+    input [TAG_BITS-1:0] cdbC_tag,
+    input [63:0] cdbC_value,
 
     output req_valid,
     output req_tid,
@@ -101,6 +124,8 @@ module mul_rs #(
     reg [31:0] free_idx;
     reg have_free2;
     reg [31:0] free_idx2;
+    reg have_free3;
+    reg [31:0] free_idx3;
     always @(*) begin
         have_free = 1'b0;
         free_idx = 0;
@@ -123,12 +148,26 @@ module mul_rs #(
                 have_free2 = 1'b1;
                 free_idx2 = fi;
             end
+
+        // Phase 16: lane 2's pick, same "exclude only what's actually
+        // consumed" reasoning one level further -- see alu_rs.v's
+        // identical free_idx3 search.
+        have_free3 = 1'b0;
+        free_idx3 = 0;
+        for (fi = DEPTH - 1; fi >= 0; fi = fi - 1)
+            if (free_mask[fi] && !(alloc_req && have_free && fi == free_idx) &&
+                !(alloc2_req && have_free2 && fi == free_idx2)) begin
+                have_free3 = 1'b1;
+                free_idx3 = fi;
+            end
     end
     assign full = !have_free;
     assign has_2_free = have_free2;
+    assign has_3_free = have_free3;
 
     wire do_alloc1 = alloc_req  && have_free;
     wire do_alloc2 = alloc2_req && have_free2;
+    wire do_alloc3 = alloc3_req && have_free3;
 
     // ---- Issue: is-own-thread-head-first, else fixed lowest-index
     // (Phase 7 -- see alu_rs.v's header) ----
@@ -196,7 +235,7 @@ module mul_rs #(
             for (fi = 0; fi < DEPTH; fi = fi + 1)
                 busy[fi] <= 1'b0;
         end else begin
-            if (cdbA_valid || cdbB_valid) begin
+            if (cdbA_valid || cdbB_valid || cdbC_valid) begin
                 for (fi = 0; fi < DEPTH; fi = fi + 1) begin
                     if (busy[fi] && !s1_ready[fi] && cdbA_valid && tid_arr[fi] == cdbA_tid && s1_tag[fi] == cdbA_tag) begin
                         s1_ready[fi] <= 1'b1;
@@ -204,6 +243,9 @@ module mul_rs #(
                     end else if (busy[fi] && !s1_ready[fi] && cdbB_valid && tid_arr[fi] == cdbB_tid && s1_tag[fi] == cdbB_tag) begin
                         s1_ready[fi] <= 1'b1;
                         s1_val[fi]   <= cdbB_value;
+                    end else if (busy[fi] && !s1_ready[fi] && cdbC_valid && tid_arr[fi] == cdbC_tid && s1_tag[fi] == cdbC_tag) begin
+                        s1_ready[fi] <= 1'b1;
+                        s1_val[fi]   <= cdbC_value;
                     end
                     if (busy[fi] && !s2_ready[fi] && cdbA_valid && tid_arr[fi] == cdbA_tid && s2_tag[fi] == cdbA_tag) begin
                         s2_ready[fi] <= 1'b1;
@@ -211,6 +253,9 @@ module mul_rs #(
                     end else if (busy[fi] && !s2_ready[fi] && cdbB_valid && tid_arr[fi] == cdbB_tid && s2_tag[fi] == cdbB_tag) begin
                         s2_ready[fi] <= 1'b1;
                         s2_val[fi]   <= cdbB_value;
+                    end else if (busy[fi] && !s2_ready[fi] && cdbC_valid && tid_arr[fi] == cdbC_tid && s2_tag[fi] == cdbC_tag) begin
+                        s2_ready[fi] <= 1'b1;
+                        s2_val[fi]   <= cdbC_value;
                     end
                 end
             end
@@ -240,6 +285,19 @@ module mul_rs #(
                 s2_val[free_idx2]   <= alloc2_src2_val;
                 s2_tag[free_idx2]   <= alloc2_src2_tag;
                 dest_tag[free_idx2] <= alloc2_dest_tag;
+            end
+            if (do_alloc3) begin
+                busy[free_idx3]     <= 1'b1;
+                tid_arr[free_idx3]  <= alloc3_tid;
+                op[free_idx3]       <= alloc3_op;
+                word_op_arr[free_idx3] <= alloc3_word_op;
+                s1_ready[free_idx3] <= alloc3_src1_ready;
+                s1_val[free_idx3]   <= alloc3_src1_val;
+                s1_tag[free_idx3]   <= alloc3_src1_tag;
+                s2_ready[free_idx3] <= alloc3_src2_ready;
+                s2_val[free_idx3]   <= alloc3_src2_val;
+                s2_tag[free_idx3]   <= alloc3_src2_tag;
+                dest_tag[free_idx3] <= alloc3_dest_tag;
             end
 
             if (req_valid && req_grant) begin

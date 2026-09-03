@@ -130,10 +130,28 @@ module lsq #(
     input [TAG_BITS-1:0] alloc2_dest_tag,
     output has_2_free,
 
-    // Two independent CDB snoop buses -- see alu_rs.v's identical port,
-    // including cdbA_tid/cdbB_tid (Phase 7 fix: ROB tags are only unique
-    // per-thread, so snoop matching must compare the full (tid,tag) pair,
-    // not the tag alone).
+    // Phase 16: a third allocation port, lane 2 of 3-wide dispatch -- same
+    // convention as alu_rs.v's alloc3 (issue/l1 access itself stays
+    // single-outstanding-per-cycle -- see this module's header and
+    // riscv64_ooo_proc.v's Phase 16 notes for why loads didn't get a
+    // wider issue path the way alu_rs.v's ALU did: l1_cache.v's primary
+    // CPU port is a genuine, single-outstanding structural resource, not
+    // an artificial one-candidate-per-cycle software limit).
+    input alloc3_req,
+    input alloc3_tid,
+    input alloc3_is_store,
+    input [2:0] alloc3_func3,
+    input [63:0] alloc3_imm,
+    input alloc3_base_ready, input [63:0] alloc3_base_val, input [TAG_BITS-1:0] alloc3_base_tag,
+    input alloc3_data_ready, input [63:0] alloc3_data_val, input [TAG_BITS-1:0] alloc3_data_tag,
+    input [TAG_BITS-1:0] alloc3_dest_tag,
+    output has_3_free,
+
+    // Three independent CDB snoop buses (Phase 16 widens this from two to
+    // three) -- see alu_rs.v's identical port, including cdbA_tid/
+    // cdbB_tid/cdbC_tid (Phase 7 fix: ROB tags are only unique per-thread,
+    // so snoop matching must compare the full (tid,tag) pair, not the tag
+    // alone).
     input cdbA_valid,
     input cdbA_tid,
     input [TAG_BITS-1:0] cdbA_tag,
@@ -142,6 +160,10 @@ module lsq #(
     input cdbB_tid,
     input [TAG_BITS-1:0] cdbB_tag,
     input [63:0] cdbB_value,
+    input cdbC_valid,
+    input cdbC_tid,
+    input [TAG_BITS-1:0] cdbC_tag,
+    input [63:0] cdbC_value,
 
     // Phase 7 (SMT): one head tag per thread, for thread-aware age
     // comparison in disambiguation/squash -- see alu_rs.v's header.
@@ -247,6 +269,8 @@ module lsq #(
     reg [31:0] free_idx;
     reg have_free2;
     reg [31:0] free_idx2;
+    reg have_free3;
+    reg [31:0] free_idx3;
     always @(*) begin
         have_free = 1'b0;
         free_idx = 0;
@@ -269,12 +293,26 @@ module lsq #(
                 have_free2 = 1'b1;
                 free_idx2 = fi;
             end
+
+        // Phase 16: lane 2's pick, same "exclude only what's actually
+        // consumed" reasoning one level further -- see alu_rs.v's
+        // identical free_idx3 search.
+        have_free3 = 1'b0;
+        free_idx3 = 0;
+        for (fi = DEPTH - 1; fi >= 0; fi = fi - 1)
+            if (free_mask[fi] && !(alloc_req && have_free && fi == free_idx) &&
+                !(alloc2_req && have_free2 && fi == free_idx2)) begin
+                have_free3 = 1'b1;
+                free_idx3 = fi;
+            end
     end
     assign full = !have_free;
     assign has_2_free = have_free2;
+    assign has_3_free = have_free3;
 
     wire do_alloc1 = alloc_req  && have_free;
     wire do_alloc2 = alloc2_req && have_free2;
+    wire do_alloc3 = alloc3_req && have_free3;
 
     // ---- Per-slot address (valid only where base_ready[i]) ----
     reg [63:0] entry_addr [0:DEPTH-1];
@@ -548,6 +586,9 @@ module lsq #(
                 end else if (busy[vi] && !base_ready[vi] && cdbB_valid && tid_arr[vi] == cdbB_tid && base_tag[vi] == cdbB_tag) begin
                     base_ready[vi] <= 1'b1;
                     base_val[vi]   <= cdbB_value;
+                end else if (busy[vi] && !base_ready[vi] && cdbC_valid && tid_arr[vi] == cdbC_tid && base_tag[vi] == cdbC_tag) begin
+                    base_ready[vi] <= 1'b1;
+                    base_val[vi]   <= cdbC_value;
                 end
                 if (busy[vi] && !data_ready[vi] && cdbA_valid && tid_arr[vi] == cdbA_tid && data_tag[vi] == cdbA_tag) begin
                     data_ready[vi] <= 1'b1;
@@ -555,6 +596,9 @@ module lsq #(
                 end else if (busy[vi] && !data_ready[vi] && cdbB_valid && tid_arr[vi] == cdbB_tid && data_tag[vi] == cdbB_tag) begin
                     data_ready[vi] <= 1'b1;
                     data_val[vi]   <= cdbB_value;
+                end else if (busy[vi] && !data_ready[vi] && cdbC_valid && tid_arr[vi] == cdbC_tid && data_tag[vi] == cdbC_tag) begin
+                    data_ready[vi] <= 1'b1;
+                    data_val[vi]   <= cdbC_value;
                 end
             end
 
@@ -585,6 +629,20 @@ module lsq #(
                 data_val[free_idx2]    <= alloc2_data_val;
                 data_tag[free_idx2]    <= alloc2_data_tag;
                 dest_tag[free_idx2]    <= alloc2_dest_tag;
+            end
+            if (do_alloc3) begin
+                busy[free_idx3]        <= 1'b1;
+                tid_arr[free_idx3]     <= alloc3_tid;
+                is_store_arr[free_idx3]<= alloc3_is_store;
+                func3[free_idx3]       <= alloc3_func3;
+                imm[free_idx3]         <= alloc3_imm;
+                base_ready[free_idx3]  <= alloc3_base_ready;
+                base_val[free_idx3]    <= alloc3_base_val;
+                base_tag[free_idx3]    <= alloc3_base_tag;
+                data_ready[free_idx3]  <= alloc3_data_ready;
+                data_val[free_idx3]    <= alloc3_data_val;
+                data_tag[free_idx3]    <= alloc3_data_tag;
+                dest_tag[free_idx3]    <= alloc3_dest_tag;
             end
 
             // Issue a new outstanding load: latch everything the eventual

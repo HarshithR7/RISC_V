@@ -36,7 +36,7 @@ REUSED_RTL = ["program_counter.v", "instruction_fetch.v", "register_file.v", "da
 OOO_RTL = ["decode_ooo.v", "rat.v", "vec_rat.v", "rob.v", "alu_rs.v", "branch_rs.v", "mul_rs.v", "div_rs.v",
            "div_fu.v", "lsq.v", "bht.v", "ras.v", "vec_rs.v", "l1_cache.v", "l2_cache.v",
            "ecc64.v", "ecc_line.v", "ecc_register_file.v", "instruction_fetch_reg.v",
-           "instruction_fetch_axi.v", "data_memory_axi.v",
+           "instruction_fetch_axi.v", "data_memory_axi.v", "icache.v", "btb.v",
            "riscv64_ooo_proc.v", "riscv64_ooo_proc_solo.v"]
 
 
@@ -185,7 +185,6 @@ def run_branch_free(name, asm_body, expected):
     """
     t = TestBuilder(name)
     t.asm(asm_body)
-    t.asm("li x31, 0xFFFF0000\necall")
     line, log = build_and_run(t)
     if not line.startswith("[PASS-T0]"):
         return f"[FAIL] {name}: core didn't reach ecall cleanly\n{log[-2000:]}"
@@ -226,7 +225,6 @@ def run_vec_test(name, asm_body, expected_vregs, lanes=4):
     """
     t = TestBuilder(name)
     t.asm(asm_body)
-    t.asm("li x31, 0xFFFF0000\necall")
     line, log = build_and_run(t)
     if not line.startswith("[PASS-T0]"):
         return f"[FAIL] {name}: core didn't reach ecall cleanly\n{log[-2000:]}"
@@ -394,6 +392,82 @@ jalr x0, x2, 0
 end:
 """)
     t.check_eq("x5", 1011)
+    return t
+
+
+def t_btb_indirect_call():
+    # Phase 17 (BTB): a non-return indirect JALR (rs1=x2, rd=x2 -- neither
+    # a link register, so ras_push_it/ras_pop_it both stay false and this
+    # falls entirely into the BTB's own scope, not RAS's) through the
+    # SAME target, executed twice via a real backward-branch loop so the
+    # SAME static jalr instruction (at `do_jump`) is resolved twice --
+    # cold the first time (falls back to today's stall path, same as
+    # before this phase), potentially BTB-predicted the second time. `x3`
+    # is materialized once, up front, via the same jal-writes-pc+4-into-
+    # rd trick t_ras_misprediction already uses to grab a label's address
+    # into a register without any assembler support for `la`.
+    t = TestBuilder("ooo_btb_indirect_call")
+    t.asm("""
+li x5, 1
+li x6, 0
+jal x3, loop_start
+jt:
+addi x5, x5, 10
+j loop_end
+loop_start:
+addi x6, x6, 1
+jalr x2, x3, 0
+loop_end:
+li x7, 2
+bne x6, x7, loop_start
+""")
+    t.check_eq("x5", 21)   # 1 -> +10 (visit 1) -> +10 (visit 2)
+    t.check_eq("x6", 2)
+    return t
+
+
+def t_btb_misprediction():
+    # Phase 17 (BTB): forces a genuine BTB-sourced misprediction -- the
+    # SAME static jalr instruction (`do_jump`) is resolved twice, to two
+    # DIFFERENT targets (jt_a then jt_b), selected via x9 based on the
+    # loop counter. If a BTB entry trained on visit 1 (jt_a) is naively
+    # reused to predict visit 2 without checking the real outcome, x5
+    # would pick up jt_a's wrong-path +10 a second time instead of jt_b's
+    # +200. Exercises the identical generic mispredict/squash/recovery
+    # machinery t_ras_misprediction already proves out for a RAS-sourced
+    # prediction (t0_mispredict's compare doesn't care which table a
+    # prediction came from), just with a BTB entry as the wrong guess.
+    t = TestBuilder("ooo_btb_misprediction")
+    t.asm("""
+li x5, 1
+li x6, 0
+jal x2, past_a
+jt_a:
+addi x5, x5, 10
+j loop_end
+past_a:
+jal x4, past_b
+jt_b:
+addi x5, x5, 200
+j loop_end
+past_b:
+addi x3, x2, 0
+loop_start:
+addi x6, x6, 1
+li x7, 1
+beq x6, x7, use_a
+addi x9, x4, 0
+j do_jump
+use_a:
+addi x9, x3, 0
+do_jump:
+jalr x2, x9, 0
+loop_end:
+li x8, 2
+bne x6, x8, loop_start
+""")
+    t.check_eq("x5", 211)  # 1 -> +10 (visit 1: jt_a) -> +200 (visit 2: jt_b)
+    t.check_eq("x6", 2)
     return t
 
 
@@ -1021,6 +1095,7 @@ def main():
 
     for fn in [t_branch_taken_not_taken, t_jal_jalr,
                t_ras_nested_calls, t_ras_misprediction, t_ras_nonlink_fallback,
+               t_btb_indirect_call, t_btb_misprediction,
                t_war_hazard, t_waw_hazard, t_backward_branch_loop,
                t_stable_operand_loop,
                t_mul_basic, t_mulw, t_mul_rs_exhaustion,
@@ -1051,12 +1126,15 @@ def main():
         # them) measured 192 cycles, ~96/divide including dispatch and
         # check_eq epilogue overhead -- so one divide plus a handful of
         # independent adds and 4 check_eq pairs comfortably fits under
-        # 200. The real signal this test is meant to catch is a
+        # 200 (Phase 16). Phase 17 (icache) added a real, honest few-cycle
+        # cost the first time this short program's cold instruction lines
+        # get fetched -- ceiling bumped to 230 to absorb that, still a
+        # small fraction of the real signal this test exists to catch: a
         # regression where an add somehow gets serialized behind the full
-        # divide latency *per add* (would blow well past 200, toward
+        # divide latency *per add* (would blow well past 230, toward
         # 64-cycles-per-add territory), not a tight cycle-count budget.
-        if cyc is None or cyc > 200:
-            line = f"[FAIL] ooo_div_overlap: cycle count {cyc} exceeds overlap-demonstration ceiling (100)"
+        if cyc is None or cyc > 230:
+            line = f"[FAIL] ooo_div_overlap: cycle count {cyc} exceeds overlap-demonstration ceiling (230)"
             print(line)
     results.append(line)
 

@@ -39,6 +39,13 @@ module ecc_register_file (
     input [4:0] write_reg2,
     input [63:0] write_data2,
 
+    // Phase 16: a third write port for 3-wide commit's head+2 retiring
+    // instruction -- same convention as write_reg2/write_data2 above,
+    // unconnected-is-safe-no-op if a caller doesn't drive reg_write3.
+    input reg_write3,
+    input [4:0] write_reg3,
+    input [63:0] write_data3,
+
     output sbe_fault,
     output dbe_fault
 );
@@ -46,7 +53,7 @@ module ecc_register_file (
     reg [7:0]  check_mem [0:31];
     integer i;
 
-    wire [7:0] wr_check1, wr_check2;
+    wire [7:0] wr_check1, wr_check2, wr_check3;
     ecc64 enc1 (
         .wr_data(write_data),  .wr_check(wr_check1),
         .rd_data(64'b0), .rd_check(8'b0),
@@ -54,6 +61,11 @@ module ecc_register_file (
     );
     ecc64 enc2 (
         .wr_data(write_data2), .wr_check(wr_check2),
+        .rd_data(64'b0), .rd_check(8'b0),
+        .rd_data_corrected(), .rd_sbe(), .rd_dbe()
+    );
+    ecc64 enc3 (
+        .wr_data(write_data3), .wr_check(wr_check3),
         .rd_data(64'b0), .rd_check(8'b0),
         .rd_data_corrected(), .rd_sbe(), .rd_dbe()
     );
@@ -66,11 +78,14 @@ module ecc_register_file (
             end
         end
         else begin
-            // Same write-port-2-wins-on-conflict ordering as
+            // Same write-port-N-wins-on-conflict ordering as
             // register_file.v (last non-blocking assignment in program
-            // order to the same index wins); data and check are updated
-            // together per port so a conflict can never leave one port's
-            // data paired with the other port's check bits.
+            // order to the same index wins -- port 3 is written last, so
+            // it wins over ports 1/2 on a same-cycle same-register
+            // conflict, matching commit's own program-order priority:
+            // head+2 is younger than head/head+1); data and check are
+            // updated together per port so a conflict can never leave one
+            // port's data paired with another port's check bits.
             if (reg_write && write_reg != 5'd0) begin
                 data_mem[write_reg]  <= write_data;
                 check_mem[write_reg] <= wr_check1;
@@ -78,6 +93,10 @@ module ecc_register_file (
             if (reg_write2 && write_reg2 != 5'd0) begin
                 data_mem[write_reg2]  <= write_data2;
                 check_mem[write_reg2] <= wr_check2;
+            end
+            if (reg_write3 && write_reg3 != 5'd0) begin
+                data_mem[write_reg3]  <= write_data3;
+                check_mem[write_reg3] <= wr_check3;
             end
         end
     end

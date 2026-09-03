@@ -62,6 +62,18 @@ module rat #(
     output rs2b_busy,
     output [TAG_BITS-1:0] rs2b_tag,
 
+    // Phase 16: a third, independent read port for lane 2 (the youngest of
+    // a 3-wide dispatch group), same raw-view convention as rs1b/rs2b above
+    // -- it reflects neither lane 0's nor lane 1's own rename, both of
+    // which are happening this same cycle via write_en/write2_en below.
+    // riscv64_ooo_proc.v's dispatch logic layers the intra-group bypass
+    // for lane 2 against *both* lane 0 and lane 1 on top of this raw read.
+    input [4:0] rs1c, rs2c,
+    output rs1c_busy,
+    output [TAG_BITS-1:0] rs1c_tag,
+    output rs2c_busy,
+    output [TAG_BITS-1:0] rs2c_tag,
+
     input write_en,          // skipped internally when rd == 0
     input [4:0] rd,
     input [TAG_BITS-1:0] new_tag,
@@ -77,6 +89,14 @@ module rat #(
     input write2_en,         // skipped internally when rd2 == 0
     input [4:0] rd2,
     input [TAG_BITS-1:0] new_tag2,
+
+    // Phase 16: lane 2's own rename, applied last of the three (after
+    // write2_en, same file order = same last-wins semantics) -- lane 2 is
+    // the youngest of the group, so if all three lanes target the same
+    // register this cycle, lane 2's rename must be the one that sticks.
+    input write3_en,         // skipped internally when rd3 == 0
+    input [4:0] rd3,
+    input [TAG_BITS-1:0] new_tag3,
 
     input commit_clear_en,   // skipped internally when commit_rd == 0
     input [4:0] commit_rd,
@@ -95,6 +115,14 @@ module rat #(
     input commit_clear_en2,
     input [4:0] commit_rd2,
     input [TAG_BITS-1:0] commit_tag2,
+
+    // Phase 16: a third, independent commit-clear for the ROB's head+2
+    // entry (rob.v's head3) -- same convention and same "always a
+    // different tag from commit_clear_en/2" reasoning as commit_clear_en2
+    // above, so no extra ordering is needed here either.
+    input commit_clear_en3,
+    input [4:0] commit_rd3,
+    input [TAG_BITS-1:0] commit_tag3,
 
     // Phase 2 speculation support: a single checkpoint (matching
     // branch_rs's own single-outstanding-branch scoping -- see
@@ -146,6 +174,11 @@ module rat #(
     assign rs2b_busy = (rs2b != 5'd0) && busy[rs2b];
     assign rs2b_tag  = (rs2b != 5'd0) ? tag[rs2b] : {TAG_BITS{1'b0}};
 
+    assign rs1c_busy = (rs1c != 5'd0) && busy[rs1c];
+    assign rs1c_tag  = (rs1c != 5'd0) ? tag[rs1c] : {TAG_BITS{1'b0}};
+    assign rs2c_busy = (rs2c != 5'd0) && busy[rs2c];
+    assign rs2c_tag  = (rs2c != 5'd0) ? tag[rs2c] : {TAG_BITS{1'b0}};
+
     integer i;
     always @(posedge clk or posedge reset) begin
         if (reset) begin
@@ -163,6 +196,9 @@ module rat #(
             if (commit_clear_en2 && commit_rd2 != 5'd0 && tag_cp[commit_rd2] == commit_tag2) begin
                 busy_cp[commit_rd2] <= 1'b0;
             end
+            if (commit_clear_en3 && commit_rd3 != 5'd0 && tag_cp[commit_rd3] == commit_tag3) begin
+                busy_cp[commit_rd3] <= 1'b0;
+            end
 
             // Order matters -- see module header. Conditional clear
             // (only if no younger producer has since remapped this
@@ -174,6 +210,9 @@ module rat #(
             if (commit_clear_en2 && commit_rd2 != 5'd0 && tag[commit_rd2] == commit_tag2) begin
                 busy[commit_rd2] <= 1'b0;
             end
+            if (commit_clear_en3 && commit_rd3 != 5'd0 && tag[commit_rd3] == commit_tag3) begin
+                busy[commit_rd3] <= 1'b0;
+            end
             if (write_en && rd != 5'd0) begin
                 busy[rd] <= 1'b1;
                 tag[rd]  <= new_tag;
@@ -181,6 +220,10 @@ module rat #(
             if (write2_en && rd2 != 5'd0) begin
                 busy[rd2] <= 1'b1;
                 tag[rd2]  <= new_tag2;
+            end
+            if (write3_en && rd3 != 5'd0) begin
+                busy[rd3] <= 1'b1;
+                tag[rd3]  <= new_tag3;
             end
 
             if (checkpoint_save) begin
@@ -191,7 +234,8 @@ module rat #(
                     // reflected in the checkpoint as not-busy, not copied
                     // from the pre-clear live value.
                     if ((commit_clear_en  && commit_rd  == i && tag[i] == commit_tag) ||
-                        (commit_clear_en2 && commit_rd2 == i && tag[i] == commit_tag2))
+                        (commit_clear_en2 && commit_rd2 == i && tag[i] == commit_tag2) ||
+                        (commit_clear_en3 && commit_rd3 == i && tag[i] == commit_tag3))
                         busy_cp[i] <= 1'b0;
                     else
                         busy_cp[i] <= busy[i];

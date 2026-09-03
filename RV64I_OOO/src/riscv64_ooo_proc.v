@@ -203,6 +203,22 @@ module riscv64_ooo_proc #(
     // apples-to-apples dispatch-width comparison. Applies identically to
     // both threads.
     parameter ENABLE_DUAL_ISSUE = 1,
+    // Phase 16 benchmarking knob, same convention as ENABLE_DUAL_ISSUE:
+    // forces lane 2 to never fire, turning this same RTL into a
+    // 2-wide-dispatch machine (still with the wider CDB/commit and
+    // 3-issue ALU underneath) so the dispatch-width-3 benchmark
+    // comparison can isolate lane 2's own marginal contribution, matching
+    // Phase 4's methodology for lane 1. Defaults to 1, same as
+    // ENABLE_DUAL_ISSUE -- see README's Phase 16 section for the
+    // feasibility analysis behind going this wide, and for the root
+    // cause (and fix) of a same-cycle commit race this phase found and
+    // initially had to ship disabled while it was still open: an
+    // external halt observer sampling architectural state in the same
+    // cycle it first saw a *predictive* (pre-edge-state) combinational
+    // commit signal, rather than waiting for the edge it predicts to
+    // actually land -- fixed at the signal itself (ecall_halt0/1, below),
+    // not by throttling this core's own real 3-way issue/commit rate.
+    parameter ENABLE_TRIPLE_ISSUE = 1,
     // Phase 6 (DLP): vector width -- SEW=32/LMUL=1 always, so VLEN =
     // LANES*32. Vector stays thread-0-only (see module header).
     parameter LANES = 4,
@@ -216,6 +232,12 @@ module riscv64_ooo_proc #(
     parameter L1_LINES = 16,
     parameter L1_LINE_BYTES = 32,
     parameter SBUF_DEPTH = 4,
+    // Phase 17 (instruction cache): see icache.v's own header for the
+    // full design -- per-thread-private, no coherency needed (this
+    // core's instruction memory is already per-thread-private).
+    parameter ICACHE_LINES = 16,
+    parameter ICACHE_LINE_BYTES = 32,
+    parameter ICACHE_MISS_LATENCY = 4,
     // Phase 12 (FPGA bring-up): 0 (default, every existing testbench)
     // keeps every instruction_fetch_reg instance on its $readmemh path;
     // 1 selects instruction_fetch_axi.v instead (see that module's own
@@ -296,13 +318,19 @@ module riscv64_ooo_proc #(
     // ================================================================
     wire [63:0] t0_pc;
     wire [63:0] t0_pc1 = t0_pc + 64'd4;
+    // Phase 16: a third, lane-2 fetch address, same "both/all lanes always
+    // fetched from their straight-line addresses every cycle" convention
+    // as t0_pc1 -- see the 3-wide dispatch section below for what happens
+    // when lane 0/1 turn out to break straight-line fetch.
+    wire [63:0] t0_pc2 = t0_pc + 64'd8;
     reg  [63:0] t0_next_pc;
-    wire [31:0] t0_instruction0, t0_instruction1;
+    wire [31:0] t0_instruction0, t0_instruction1, t0_instruction2;
 
     // Phase 11: paired with instruction_fetch_reg's own 1-cycle latency
     // -- see this file's header addendum.
     reg [63:0] t0_pc_latched;
     wire [63:0] t0_pc1_latched = t0_pc_latched + 64'd4;
+    wire [63:0] t0_pc2_latched = t0_pc_latched + 64'd8;
     reg t0_fetch_valid;
     always @(posedge clk or posedge reset) begin
         if (reset) begin
@@ -315,12 +343,20 @@ module riscv64_ooo_proc #(
     end
 
     program_counter t0_pc_module (.clk(clk), .reset(reset), .pc_in(t0_next_pc), .pc_out(t0_pc));
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t0_if0 (
-        .clk(clk), .pc(t0_pc), .instruction(t0_instruction0),
-        .axi_wr_en(t0_imem_axi_wr_en), .axi_wr_addr(t0_imem_axi_wr_addr), .axi_wr_data(t0_imem_axi_wr_data)
-    );
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t0_if1 (
-        .clk(clk), .pc(t0_pc1), .instruction(t0_instruction1),
+    // Phase 17: one shared icache instance replaces the 3 independent
+    // instruction_fetch_reg instances this thread used to have (t0_if0/
+    // if1/if2) -- see icache.v's header. Hit latency stays exactly 1
+    // cycle, matching those modules' own timing, so t0_pc_latched/
+    // t0_fetch_valid above need no changes; t0_icache_stall (below) is
+    // the only new signal, gating lane0_fire the same way jalr_stall
+    // already does.
+    wire t0_icache_stall;
+    icache #(.IMEM_FILE(IMEM_FILE0), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM),
+             .LINES(ICACHE_LINES), .LINE_BYTES(ICACHE_LINE_BYTES), .MISS_LATENCY(ICACHE_MISS_LATENCY)) t0_icache_i (
+        .clk(clk), .reset(reset),
+        .pc(t0_pc), .pc1(t0_pc1), .pc2(t0_pc2),
+        .instruction0(t0_instruction0), .instruction1(t0_instruction1), .instruction2(t0_instruction2),
+        .stall(t0_icache_stall),
         .axi_wr_en(t0_imem_axi_wr_en), .axi_wr_addr(t0_imem_axi_wr_addr), .axi_wr_data(t0_imem_axi_wr_data)
     );
     assign pc_out0 = t0_pc_latched;
@@ -369,17 +405,43 @@ module riscv64_ooo_proc #(
         .src1_is_zero(t0_d1_src1_is_zero), .src1_is_pc(t0_d1_src1_is_pc)
     );
 
+    // Phase 16: lane 2 (youngest of 3-wide dispatch). Like lane 1, lane 2
+    // can never itself be branch-class (see the dispatch section below) --
+    // only vector stays lane-0-only too, so lane 2 needs no is_vec/v_op/
+    // is_vmv outputs either, same scope cut as lane 1's decoder above.
+    wire [4:0] t0_d2_rs1, t0_d2_rs2, t0_d2_rd;
+    wire [2:0] t0_d2_func3;
+    wire [63:0] t0_d2_imm;
+    wire t0_d2_is_alu, t0_d2_is_muldiv, t0_d2_is_branch, t0_d2_is_jal, t0_d2_is_jalr, t0_d2_is_load, t0_d2_is_store, t0_d2_is_ecall;
+    wire [3:0] t0_d2_alu_op;
+    wire t0_d2_word_op;
+    wire [2:0] t0_d2_muldiv_op;
+    wire t0_d2_reg_write, t0_d2_src2_is_imm, t0_d2_src1_is_zero, t0_d2_src1_is_pc;
+
+    decode_ooo t0_dec2 (
+        .instruction(t0_instruction2),
+        .rs1(t0_d2_rs1), .rs2(t0_d2_rs2), .rd(t0_d2_rd), .func3(t0_d2_func3), .imm(t0_d2_imm),
+        .is_alu(t0_d2_is_alu), .is_muldiv(t0_d2_is_muldiv), .is_branch(t0_d2_is_branch),
+        .is_jal(t0_d2_is_jal), .is_jalr(t0_d2_is_jalr), .is_load(t0_d2_is_load), .is_store(t0_d2_is_store),
+        .is_ecall(t0_d2_is_ecall),
+        .alu_op(t0_d2_alu_op), .word_op(t0_d2_word_op), .muldiv_op(t0_d2_muldiv_op),
+        .reg_write(t0_d2_reg_write), .src2_is_imm(t0_d2_src2_is_imm),
+        .src1_is_zero(t0_d2_src1_is_zero), .src1_is_pc(t0_d2_src1_is_pc)
+    );
+
     // ================================================================
     // ---- Thread 1 front end: fetch, decode (no vector support) -----
     // ================================================================
     wire [63:0] t1_pc;
     wire [63:0] t1_pc1 = t1_pc + 64'd4;
+    wire [63:0] t1_pc2 = t1_pc + 64'd8;
     reg  [63:0] t1_next_pc;
-    wire [31:0] t1_instruction0, t1_instruction1;
+    wire [31:0] t1_instruction0, t1_instruction1, t1_instruction2;
 
     // Phase 11: mirrors t0's own latch/valid pair above.
     reg [63:0] t1_pc_latched;
     wire [63:0] t1_pc1_latched = t1_pc_latched + 64'd4;
+    wire [63:0] t1_pc2_latched = t1_pc_latched + 64'd8;
     reg t1_fetch_valid;
     always @(posedge clk or posedge reset) begin
         if (reset) begin
@@ -392,12 +454,14 @@ module riscv64_ooo_proc #(
     end
 
     program_counter t1_pc_module (.clk(clk), .reset(reset), .pc_in(t1_next_pc), .pc_out(t1_pc));
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t1_if0 (
-        .clk(clk), .pc(t1_pc), .instruction(t1_instruction0),
-        .axi_wr_en(t1_imem_axi_wr_en), .axi_wr_addr(t1_imem_axi_wr_addr), .axi_wr_data(t1_imem_axi_wr_data)
-    );
-    instruction_fetch_reg #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM)) t1_if1 (
-        .clk(clk), .pc(t1_pc1), .instruction(t1_instruction1),
+    // Phase 17: mirrors t0's own icache instance above.
+    wire t1_icache_stall;
+    icache #(.IMEM_FILE(IMEM_FILE1), .IMEM_WORDS(IMEM_WORDS), .USE_AXI_MEM(USE_AXI_MEM),
+             .LINES(ICACHE_LINES), .LINE_BYTES(ICACHE_LINE_BYTES), .MISS_LATENCY(ICACHE_MISS_LATENCY)) t1_icache_i (
+        .clk(clk), .reset(reset),
+        .pc(t1_pc), .pc1(t1_pc1), .pc2(t1_pc2),
+        .instruction0(t1_instruction0), .instruction1(t1_instruction1), .instruction2(t1_instruction2),
+        .stall(t1_icache_stall),
         .axi_wr_en(t1_imem_axi_wr_en), .axi_wr_addr(t1_imem_axi_wr_addr), .axi_wr_data(t1_imem_axi_wr_data)
     );
     assign pc_out1 = t1_pc_latched;
@@ -448,6 +512,29 @@ module riscv64_ooo_proc #(
         .src1_is_zero(t1_d1_src1_is_zero), .src1_is_pc(t1_d1_src1_is_pc)
     );
 
+    // Phase 16: lane 2, thread 1 -- mirrors t0_dec2 above (no vector
+    // outputs wired, same "structurally thread-0-only" reasoning as
+    // t1_dec0/t1_dec1).
+    wire [4:0] t1_d2_rs1, t1_d2_rs2, t1_d2_rd;
+    wire [2:0] t1_d2_func3;
+    wire [63:0] t1_d2_imm;
+    wire t1_d2_is_alu, t1_d2_is_muldiv, t1_d2_is_branch, t1_d2_is_jal, t1_d2_is_jalr, t1_d2_is_load, t1_d2_is_store, t1_d2_is_ecall;
+    wire [3:0] t1_d2_alu_op;
+    wire t1_d2_word_op;
+    wire [2:0] t1_d2_muldiv_op;
+    wire t1_d2_reg_write, t1_d2_src2_is_imm, t1_d2_src1_is_zero, t1_d2_src1_is_pc;
+
+    decode_ooo t1_dec2 (
+        .instruction(t1_instruction2),
+        .rs1(t1_d2_rs1), .rs2(t1_d2_rs2), .rd(t1_d2_rd), .func3(t1_d2_func3), .imm(t1_d2_imm),
+        .is_alu(t1_d2_is_alu), .is_muldiv(t1_d2_is_muldiv), .is_branch(t1_d2_is_branch),
+        .is_jal(t1_d2_is_jal), .is_jalr(t1_d2_is_jalr), .is_load(t1_d2_is_load), .is_store(t1_d2_is_store),
+        .is_ecall(t1_d2_is_ecall),
+        .alu_op(t1_d2_alu_op), .word_op(t1_d2_word_op), .muldiv_op(t1_d2_muldiv_op),
+        .reg_write(t1_d2_reg_write), .src2_is_imm(t1_d2_src2_is_imm),
+        .src1_is_zero(t1_d2_src1_is_zero), .src1_is_pc(t1_d2_src1_is_pc)
+    );
+
     // ================================================================
     // ---- Active-thread mux: the "shared dispatch logic" view -------
     // ================================================================
@@ -464,7 +551,11 @@ module riscv64_ooo_proc #(
     // file's header addendum.
     wire [63:0] pc      = active_thread ? t1_pc_latched      : t0_pc_latched;
     wire [63:0] pc1     = active_thread ? t1_pc1_latched     : t0_pc1_latched;
+    wire [63:0] pc2     = active_thread ? t1_pc2_latched     : t0_pc2_latched;
     wire fetch_valid    = active_thread ? t1_fetch_valid     : t0_fetch_valid;
+    // Phase 17: icache miss stall, same active-thread mux shape as
+    // fetch_valid above -- see icache.v's header and lane0_fire below.
+    wire icache_stall   = active_thread ? t1_icache_stall    : t0_icache_stall;
 
     wire [4:0] d0_rs1 = active_thread ? t1_d0_rs1 : t0_d0_rs1;
     wire [4:0] d0_rs2 = active_thread ? t1_d0_rs2 : t0_d0_rs2;
@@ -508,10 +599,31 @@ module riscv64_ooo_proc #(
     wire d1_src1_is_zero = active_thread ? t1_d1_src1_is_zero : t0_d1_src1_is_zero;
     wire d1_src1_is_pc   = active_thread ? t1_d1_src1_is_pc   : t0_d1_src1_is_pc;
 
+    // Phase 16: lane 2's muxed view, same shape as lane 1's above (lane 2
+    // is never branch-class either -- see the dispatch section below).
+    wire [4:0] d2_rs1 = active_thread ? t1_d2_rs1 : t0_d2_rs1;
+    wire [4:0] d2_rs2 = active_thread ? t1_d2_rs2 : t0_d2_rs2;
+    wire [4:0] d2_rd  = active_thread ? t1_d2_rd  : t0_d2_rd;
+    wire [2:0] d2_func3 = active_thread ? t1_d2_func3 : t0_d2_func3;
+    wire [63:0] d2_imm  = active_thread ? t1_d2_imm  : t0_d2_imm;
+    wire d2_is_alu    = active_thread ? t1_d2_is_alu    : t0_d2_is_alu;
+    wire d2_is_muldiv = active_thread ? t1_d2_is_muldiv : t0_d2_is_muldiv;
+    wire d2_is_load   = active_thread ? t1_d2_is_load   : t0_d2_is_load;
+    wire d2_is_store  = active_thread ? t1_d2_is_store  : t0_d2_is_store;
+    wire [3:0] d2_alu_op = active_thread ? t1_d2_alu_op : t0_d2_alu_op;
+    wire d2_word_op       = active_thread ? t1_d2_word_op   : t0_d2_word_op;
+    wire [2:0] d2_muldiv_op = active_thread ? t1_d2_muldiv_op : t0_d2_muldiv_op;
+    wire d2_reg_write    = active_thread ? t1_d2_reg_write    : t0_d2_reg_write;
+    wire d2_src2_is_imm  = active_thread ? t1_d2_src2_is_imm  : t0_d2_src2_is_imm;
+    wire d2_src1_is_zero = active_thread ? t1_d2_src1_is_zero : t0_d2_src1_is_zero;
+    wire d2_src1_is_pc   = active_thread ? t1_d2_src1_is_pc   : t0_d2_src1_is_pc;
+
     wire d0_is_mul = d0_is_muldiv && !d0_muldiv_op[2];
     wire d0_is_div = d0_is_muldiv && d0_muldiv_op[2];
     wire d1_is_mul = d1_is_muldiv && !d1_muldiv_op[2];
     wire d1_is_div = d1_is_muldiv && d1_muldiv_op[2];
+    wire d2_is_mul = d2_is_muldiv && !d2_muldiv_op[2];
+    wire d2_is_div = d2_is_muldiv && d2_muldiv_op[2];
 
     // ================================================================
     // ---- Register renaming (RAT) + architectural register file -----
@@ -526,10 +638,12 @@ module riscv64_ooo_proc #(
     wire [TB-1:0] t0_rs1_tag, t0_rs2_tag;
     wire t0_rs1b_busy_raw, t0_rs2b_busy_raw;
     wire [TB-1:0] t0_rs1b_tag_raw, t0_rs2b_tag_raw;
-    wire t0_rat_write_en, t0_rat_write2_en;
-    wire t0_rat_commit_clear_en, t0_rat_commit_clear_en2;
-    wire [4:0] t0_rat_commit_rd, t0_rat_commit_rd2;
-    wire [TB-1:0] t0_rat_commit_tag, t0_rat_commit_tag2;
+    wire t0_rs1c_busy_raw, t0_rs2c_busy_raw;
+    wire [TB-1:0] t0_rs1c_tag_raw, t0_rs2c_tag_raw;
+    wire t0_rat_write_en, t0_rat_write2_en, t0_rat_write3_en;
+    wire t0_rat_commit_clear_en, t0_rat_commit_clear_en2, t0_rat_commit_clear_en3;
+    wire [4:0] t0_rat_commit_rd, t0_rat_commit_rd2, t0_rat_commit_rd3;
+    wire [TB-1:0] t0_rat_commit_tag, t0_rat_commit_tag2, t0_rat_commit_tag3;
 
     rat #(.TAG_BITS(TB)) t0_rat_i (
         .clk(clk), .reset(reset),
@@ -539,10 +653,15 @@ module riscv64_ooo_proc #(
         .rs1b(t0_d1_rs1), .rs2b(t0_d1_rs2),
         .rs1b_busy(t0_rs1b_busy_raw), .rs1b_tag(t0_rs1b_tag_raw),
         .rs2b_busy(t0_rs2b_busy_raw), .rs2b_tag(t0_rs2b_tag_raw),
+        .rs1c(t0_d2_rs1), .rs2c(t0_d2_rs2),
+        .rs1c_busy(t0_rs1c_busy_raw), .rs1c_tag(t0_rs1c_tag_raw),
+        .rs2c_busy(t0_rs2c_busy_raw), .rs2c_tag(t0_rs2c_tag_raw),
         .write_en(t0_rat_write_en), .rd(t0_d0_rd), .new_tag(rat_new_tag),
         .write2_en(t0_rat_write2_en), .rd2(t0_d1_rd), .new_tag2(rat_new_tag2),
+        .write3_en(t0_rat_write3_en), .rd3(t0_d2_rd), .new_tag3(rat_new_tag3),
         .commit_clear_en(t0_rat_commit_clear_en), .commit_rd(t0_rat_commit_rd), .commit_tag(t0_rat_commit_tag),
         .commit_clear_en2(t0_rat_commit_clear_en2), .commit_rd2(t0_rat_commit_rd2), .commit_tag2(t0_rat_commit_tag2),
+        .commit_clear_en3(t0_rat_commit_clear_en3), .commit_rd3(t0_rat_commit_rd3), .commit_tag3(t0_rat_commit_tag3),
         .checkpoint_save(t0_rat_checkpoint_save), .checkpoint_restore(t0_mispredict)
     );
 
@@ -550,10 +669,12 @@ module riscv64_ooo_proc #(
     wire [TB-1:0] t1_rs1_tag, t1_rs2_tag;
     wire t1_rs1b_busy_raw, t1_rs2b_busy_raw;
     wire [TB-1:0] t1_rs1b_tag_raw, t1_rs2b_tag_raw;
-    wire t1_rat_write_en, t1_rat_write2_en;
-    wire t1_rat_commit_clear_en, t1_rat_commit_clear_en2;
-    wire [4:0] t1_rat_commit_rd, t1_rat_commit_rd2;
-    wire [TB-1:0] t1_rat_commit_tag, t1_rat_commit_tag2;
+    wire t1_rs1c_busy_raw, t1_rs2c_busy_raw;
+    wire [TB-1:0] t1_rs1c_tag_raw, t1_rs2c_tag_raw;
+    wire t1_rat_write_en, t1_rat_write2_en, t1_rat_write3_en;
+    wire t1_rat_commit_clear_en, t1_rat_commit_clear_en2, t1_rat_commit_clear_en3;
+    wire [4:0] t1_rat_commit_rd, t1_rat_commit_rd2, t1_rat_commit_rd3;
+    wire [TB-1:0] t1_rat_commit_tag, t1_rat_commit_tag2, t1_rat_commit_tag3;
 
     rat #(.TAG_BITS(TB)) t1_rat_i (
         .clk(clk), .reset(reset),
@@ -563,10 +684,15 @@ module riscv64_ooo_proc #(
         .rs1b(t1_d1_rs1), .rs2b(t1_d1_rs2),
         .rs1b_busy(t1_rs1b_busy_raw), .rs1b_tag(t1_rs1b_tag_raw),
         .rs2b_busy(t1_rs2b_busy_raw), .rs2b_tag(t1_rs2b_tag_raw),
+        .rs1c(t1_d2_rs1), .rs2c(t1_d2_rs2),
+        .rs1c_busy(t1_rs1c_busy_raw), .rs1c_tag(t1_rs1c_tag_raw),
+        .rs2c_busy(t1_rs2c_busy_raw), .rs2c_tag(t1_rs2c_tag_raw),
         .write_en(t1_rat_write_en), .rd(t1_d0_rd), .new_tag(rat_new_tag),
         .write2_en(t1_rat_write2_en), .rd2(t1_d1_rd), .new_tag2(rat_new_tag2),
+        .write3_en(t1_rat_write3_en), .rd3(t1_d2_rd), .new_tag3(rat_new_tag3),
         .commit_clear_en(t1_rat_commit_clear_en), .commit_rd(t1_rat_commit_rd), .commit_tag(t1_rat_commit_tag),
         .commit_clear_en2(t1_rat_commit_clear_en2), .commit_rd2(t1_rat_commit_rd2), .commit_tag2(t1_rat_commit_tag2),
+        .commit_clear_en3(t1_rat_commit_clear_en3), .commit_rd3(t1_rat_commit_rd3), .commit_tag3(t1_rat_commit_tag3),
         .checkpoint_save(t1_rat_checkpoint_save), .checkpoint_restore(t1_mispredict)
     );
 
@@ -578,6 +704,10 @@ module riscv64_ooo_proc #(
     wire [TB-1:0] rs1b_tag_raw = active_thread ? t1_rs1b_tag_raw : t0_rs1b_tag_raw;
     wire rs2b_busy_raw    = active_thread ? t1_rs2b_busy_raw : t0_rs2b_busy_raw;
     wire [TB-1:0] rs2b_tag_raw = active_thread ? t1_rs2b_tag_raw : t0_rs2b_tag_raw;
+    wire rs1c_busy_raw    = active_thread ? t1_rs1c_busy_raw : t0_rs1c_busy_raw;
+    wire [TB-1:0] rs1c_tag_raw = active_thread ? t1_rs1c_tag_raw : t0_rs1c_tag_raw;
+    wire rs2c_busy_raw    = active_thread ? t1_rs2c_busy_raw : t0_rs2c_busy_raw;
+    wire [TB-1:0] rs2c_tag_raw = active_thread ? t1_rs2c_tag_raw : t0_rs2c_tag_raw;
 
     // Widened-commit support (Phase 5): both register_file instances per
     // thread get a second write port, fed identically.
@@ -587,8 +717,13 @@ module riscv64_ooo_proc #(
     // ecc_rf_sbe_fault/ecc_rf_dbe_fault outputs further down. See
     // ecc_register_file.v's header for why this is a new file rather than
     // an edit to the shared RV64I/src/register_file.v.
-    wire [63:0] t0_rf0_read1, t0_rf0_read2, t0_rf1_read1, t0_rf1_read2;
-    wire t0_rf0_sbe, t0_rf0_dbe, t0_rf1_sbe, t0_rf1_dbe;
+    // Phase 16: a third instance per thread (regfile2) gives lane 2 its
+    // own read ports, same "extra read ports on what is logically one
+    // array" reasoning as regfile0/1 -- all instances per thread are fed
+    // identical clock/reset/write signals, so they always hold identical
+    // state.
+    wire [63:0] t0_rf0_read1, t0_rf0_read2, t0_rf1_read1, t0_rf1_read2, t0_rf2_read1, t0_rf2_read2;
+    wire t0_rf0_sbe, t0_rf0_dbe, t0_rf1_sbe, t0_rf1_dbe, t0_rf2_sbe, t0_rf2_dbe;
     ecc_register_file t0_regfile0 (
         .clk(clk), .reset(reset),
         .reg_write(t0_commit_rf_write_en),
@@ -596,6 +731,7 @@ module riscv64_ooo_proc #(
         .write_data(t0_commit_rf_write_data),
         .read_data1(t0_rf0_read1), .read_data2(t0_rf0_read2),
         .reg_write2(t0_commit_rf_write_en2), .write_reg2(t0_commit_rf_write_reg2), .write_data2(t0_commit_rf_write_data2),
+        .reg_write3(t0_commit_rf_write_en3), .write_reg3(t0_commit_rf_write_reg3), .write_data3(t0_commit_rf_write_data3),
         .sbe_fault(t0_rf0_sbe), .dbe_fault(t0_rf0_dbe)
     );
     ecc_register_file t0_regfile1 (
@@ -605,11 +741,22 @@ module riscv64_ooo_proc #(
         .write_data(t0_commit_rf_write_data),
         .read_data1(t0_rf1_read1), .read_data2(t0_rf1_read2),
         .reg_write2(t0_commit_rf_write_en2), .write_reg2(t0_commit_rf_write_reg2), .write_data2(t0_commit_rf_write_data2),
+        .reg_write3(t0_commit_rf_write_en3), .write_reg3(t0_commit_rf_write_reg3), .write_data3(t0_commit_rf_write_data3),
         .sbe_fault(t0_rf1_sbe), .dbe_fault(t0_rf1_dbe)
     );
+    ecc_register_file t0_regfile2 (
+        .clk(clk), .reset(reset),
+        .reg_write(t0_commit_rf_write_en),
+        .read_reg1(t0_d2_rs1), .read_reg2(t0_d2_rs2), .write_reg(t0_commit_rf_write_reg),
+        .write_data(t0_commit_rf_write_data),
+        .read_data1(t0_rf2_read1), .read_data2(t0_rf2_read2),
+        .reg_write2(t0_commit_rf_write_en2), .write_reg2(t0_commit_rf_write_reg2), .write_data2(t0_commit_rf_write_data2),
+        .reg_write3(t0_commit_rf_write_en3), .write_reg3(t0_commit_rf_write_reg3), .write_data3(t0_commit_rf_write_data3),
+        .sbe_fault(t0_rf2_sbe), .dbe_fault(t0_rf2_dbe)
+    );
 
-    wire [63:0] t1_rf0_read1, t1_rf0_read2, t1_rf1_read1, t1_rf1_read2;
-    wire t1_rf0_sbe, t1_rf0_dbe, t1_rf1_sbe, t1_rf1_dbe;
+    wire [63:0] t1_rf0_read1, t1_rf0_read2, t1_rf1_read1, t1_rf1_read2, t1_rf2_read1, t1_rf2_read2;
+    wire t1_rf0_sbe, t1_rf0_dbe, t1_rf1_sbe, t1_rf1_dbe, t1_rf2_sbe, t1_rf2_dbe;
     ecc_register_file t1_regfile0 (
         .clk(clk), .reset(reset),
         .reg_write(t1_commit_rf_write_en),
@@ -617,6 +764,7 @@ module riscv64_ooo_proc #(
         .write_data(t1_commit_rf_write_data),
         .read_data1(t1_rf0_read1), .read_data2(t1_rf0_read2),
         .reg_write2(t1_commit_rf_write_en2), .write_reg2(t1_commit_rf_write_reg2), .write_data2(t1_commit_rf_write_data2),
+        .reg_write3(t1_commit_rf_write_en3), .write_reg3(t1_commit_rf_write_reg3), .write_data3(t1_commit_rf_write_data3),
         .sbe_fault(t1_rf0_sbe), .dbe_fault(t1_rf0_dbe)
     );
     ecc_register_file t1_regfile1 (
@@ -626,11 +774,22 @@ module riscv64_ooo_proc #(
         .write_data(t1_commit_rf_write_data),
         .read_data1(t1_rf1_read1), .read_data2(t1_rf1_read2),
         .reg_write2(t1_commit_rf_write_en2), .write_reg2(t1_commit_rf_write_reg2), .write_data2(t1_commit_rf_write_data2),
+        .reg_write3(t1_commit_rf_write_en3), .write_reg3(t1_commit_rf_write_reg3), .write_data3(t1_commit_rf_write_data3),
         .sbe_fault(t1_rf1_sbe), .dbe_fault(t1_rf1_dbe)
     );
+    ecc_register_file t1_regfile2 (
+        .clk(clk), .reset(reset),
+        .reg_write(t1_commit_rf_write_en),
+        .read_reg1(t1_d2_rs1), .read_reg2(t1_d2_rs2), .write_reg(t1_commit_rf_write_reg),
+        .write_data(t1_commit_rf_write_data),
+        .read_data1(t1_rf2_read1), .read_data2(t1_rf2_read2),
+        .reg_write2(t1_commit_rf_write_en2), .write_reg2(t1_commit_rf_write_reg2), .write_data2(t1_commit_rf_write_data2),
+        .reg_write3(t1_commit_rf_write_en3), .write_reg3(t1_commit_rf_write_reg3), .write_data3(t1_commit_rf_write_data3),
+        .sbe_fault(t1_rf2_sbe), .dbe_fault(t1_rf2_dbe)
+    );
 
-    assign ecc_rf_sbe_fault = t0_rf0_sbe || t0_rf1_sbe || t1_rf0_sbe || t1_rf1_sbe;
-    assign ecc_rf_dbe_fault = t0_rf0_dbe || t0_rf1_dbe || t1_rf0_dbe || t1_rf1_dbe;
+    assign ecc_rf_sbe_fault = t0_rf0_sbe || t0_rf1_sbe || t0_rf2_sbe || t1_rf0_sbe || t1_rf1_sbe || t1_rf2_sbe;
+    assign ecc_rf_dbe_fault = t0_rf0_dbe || t0_rf1_dbe || t0_rf2_dbe || t1_rf0_dbe || t1_rf1_dbe || t1_rf2_dbe;
 
     assign ecc_rob_sbe_fault = t0_rob_ecc_sbe || t1_rob_ecc_sbe;
     assign ecc_rob_dbe_fault = t0_rob_ecc_dbe || t1_rob_ecc_dbe;
@@ -639,6 +798,8 @@ module riscv64_ooo_proc #(
     wire [63:0] rf_read2  = active_thread ? t1_rf0_read2 : t0_rf0_read2;
     wire [63:0] rf1_read1 = active_thread ? t1_rf1_read1 : t0_rf1_read1;
     wire [63:0] rf1_read2 = active_thread ? t1_rf1_read2 : t0_rf1_read2;
+    wire [63:0] rf2_read1 = active_thread ? t1_rf2_read1 : t0_rf2_read1;
+    wire [63:0] rf2_read2 = active_thread ? t1_rf2_read2 : t0_rf2_read2;
 
     // ---- Vector register renaming (vec_rat) + vector register file --------
     // Thread-0-only (see module header): reads/writes always use thread
@@ -677,12 +838,12 @@ module riscv64_ooo_proc #(
     // ================================================================
     // ---- Reorder buffers (one full instance per thread) ------------
     // ================================================================
-    wire t0_rob_alloc_req, t0_rob_alloc2_req;
-    wire [TB-1:0] t0_rob_alloc_tag, t0_rob_alloc2_tag;
+    wire t0_rob_alloc_req, t0_rob_alloc2_req, t0_rob_alloc3_req;
+    wire [TB-1:0] t0_rob_alloc_tag, t0_rob_alloc2_tag, t0_rob_alloc3_tag;
     wire [TB:0] t0_rob_free_count;
-    wire t0_rob_mark_valid, t0_rob_mark_b_valid;
-    wire [TB-1:0] t0_rob_mark_tag, t0_rob_mark_b_tag;
-    wire [63:0] t0_rob_mark_value, t0_rob_mark_b_value;
+    wire t0_rob_mark_valid, t0_rob_mark_b_valid, t0_rob_mark_c_valid;
+    wire [TB-1:0] t0_rob_mark_tag, t0_rob_mark_b_tag, t0_rob_mark_c_tag;
+    wire [63:0] t0_rob_mark_value, t0_rob_mark_b_value, t0_rob_mark_c_value;
     wire t0_rob_mark2_valid;
     wire [TB-1:0] t0_rob_mark2_tag;
     wire t0_rob_head_ready;
@@ -703,8 +864,19 @@ module riscv64_ooo_proc #(
     wire t0_rob_head2_is_vec_dest;
     wire t0_rob_head2_is_store, t0_rob_head2_is_ecall;
     wire t0_rob_commit_req2;
+    wire t0_rob_head3_ready;
+    wire [TB-1:0] t0_rob_head3_tag;
+    wire t0_rob_head3_has_dest;
+    wire [4:0] t0_rob_head3_rd;
+    wire [63:0] t0_rob_head3_value;
+    wire [VLEN-1:0] t0_rob_head3_vec_value;
+    wire t0_rob_head3_is_vec_dest;
+    wire t0_rob_head3_is_store, t0_rob_head3_is_ecall;
+    wire t0_rob_commit_req3;
     wire t0_rob_rs1_done, t0_rob_rs2_done, t0_rob_rs1b_done, t0_rob_rs2b_done;
     wire [63:0] t0_rob_rs1_value, t0_rob_rs2_value, t0_rob_rs1b_value, t0_rob_rs2b_value;
+    wire t0_rob_rs1c_done, t0_rob_rs2c_done;
+    wire [63:0] t0_rob_rs1c_value, t0_rob_rs2c_value;
     wire t0_rob_vs1_done, t0_rob_vs2_done;
     wire [VLEN-1:0] t0_rob_vs1_value, t0_rob_vs2_value;
     wire t0_rob_ecc_sbe, t0_rob_ecc_dbe;
@@ -717,8 +889,12 @@ module riscv64_ooo_proc #(
         .alloc2_req(t0_rob_alloc2_req), .alloc2_has_dest(t0_d1_reg_write), .alloc2_rd(t0_d1_rd),
         .alloc2_is_store(t0_d1_is_store), .alloc2_is_ecall(t0_d1_is_ecall), .alloc2_is_vec_dest(1'b0),
         .alloc2_tag(t0_rob_alloc2_tag), .free_count(t0_rob_free_count),
+        .alloc3_req(t0_rob_alloc3_req), .alloc3_has_dest(t0_d2_reg_write), .alloc3_rd(t0_d2_rd),
+        .alloc3_is_store(t0_d2_is_store), .alloc3_is_ecall(t0_d2_is_ecall), .alloc3_is_vec_dest(1'b0),
+        .alloc3_tag(t0_rob_alloc3_tag),
         .mark_valid(t0_rob_mark_valid), .mark_tag(t0_rob_mark_tag), .mark_value(t0_rob_mark_value),
         .mark_b_valid(t0_rob_mark_b_valid), .mark_b_tag(t0_rob_mark_b_tag), .mark_b_value(t0_rob_mark_b_value),
+        .mark_c_valid(t0_rob_mark_c_valid), .mark_c_tag(t0_rob_mark_c_tag), .mark_c_value(t0_rob_mark_c_value),
         .vec_mark_valid(vec_mark_valid), .vec_mark_tag(vec_mark_tag), .vec_mark_value(vec_mark_value),
         .mark2_valid(t0_rob_mark2_valid), .mark2_tag(t0_rob_mark2_tag),
         .extra_mark_valid(t0_lsq_extra_mark_valid), .extra_mark_tag_flat(lsq_store_ready_tag_flat),
@@ -727,6 +903,8 @@ module riscv64_ooo_proc #(
         .lookup2_tag(t0_rs2_tag), .lookup2_done(t0_rob_rs2_done), .lookup2_value(t0_rob_rs2_value),
         .lookup3_tag(t0_rs1b_tag_raw), .lookup3_done(t0_rob_rs1b_done), .lookup3_value(t0_rob_rs1b_value),
         .lookup4_tag(t0_rs2b_tag_raw), .lookup4_done(t0_rob_rs2b_done), .lookup4_value(t0_rob_rs2b_value),
+        .lookup5_tag(t0_rs1c_tag_raw), .lookup5_done(t0_rob_rs1c_done), .lookup5_value(t0_rob_rs1c_value),
+        .lookup6_tag(t0_rs2c_tag_raw), .lookup6_done(t0_rob_rs2c_done), .lookup6_value(t0_rob_rs2c_value),
         .vec_lookup1_tag(vs1_tag), .vec_lookup1_done(t0_rob_vs1_done), .vec_lookup1_value(t0_rob_vs1_value),
         .vec_lookup2_tag(vs2_tag), .vec_lookup2_done(t0_rob_vs2_done), .vec_lookup2_value(t0_rob_vs2_value),
         .head_ready(t0_rob_head_ready), .head_tag(t0_rob_head_tag), .head_has_dest(t0_rob_head_has_dest),
@@ -739,15 +917,20 @@ module riscv64_ooo_proc #(
         .head2_vec_value(t0_rob_head2_vec_value), .head2_is_vec_dest(t0_rob_head2_is_vec_dest),
         .head2_is_store(t0_rob_head2_is_store), .head2_is_ecall(t0_rob_head2_is_ecall),
         .commit_req2(t0_rob_commit_req2),
+        .head3_ready(t0_rob_head3_ready), .head3_tag(t0_rob_head3_tag), .head3_has_dest(t0_rob_head3_has_dest),
+        .head3_rd(t0_rob_head3_rd), .head3_value(t0_rob_head3_value),
+        .head3_vec_value(t0_rob_head3_vec_value), .head3_is_vec_dest(t0_rob_head3_is_vec_dest),
+        .head3_is_store(t0_rob_head3_is_store), .head3_is_ecall(t0_rob_head3_is_ecall),
+        .commit_req3(t0_rob_commit_req3),
         .ecc_rob_sbe_fault(t0_rob_ecc_sbe), .ecc_rob_dbe_fault(t0_rob_ecc_dbe)
     );
 
-    wire t1_rob_alloc_req, t1_rob_alloc2_req;
-    wire [TB-1:0] t1_rob_alloc_tag, t1_rob_alloc2_tag;
+    wire t1_rob_alloc_req, t1_rob_alloc2_req, t1_rob_alloc3_req;
+    wire [TB-1:0] t1_rob_alloc_tag, t1_rob_alloc2_tag, t1_rob_alloc3_tag;
     wire [TB:0] t1_rob_free_count;
-    wire t1_rob_mark_valid, t1_rob_mark_b_valid;
-    wire [TB-1:0] t1_rob_mark_tag, t1_rob_mark_b_tag;
-    wire [63:0] t1_rob_mark_value, t1_rob_mark_b_value;
+    wire t1_rob_mark_valid, t1_rob_mark_b_valid, t1_rob_mark_c_valid;
+    wire [TB-1:0] t1_rob_mark_tag, t1_rob_mark_b_tag, t1_rob_mark_c_tag;
+    wire [63:0] t1_rob_mark_value, t1_rob_mark_b_value, t1_rob_mark_c_value;
     wire t1_rob_mark2_valid;
     wire [TB-1:0] t1_rob_mark2_tag;
     wire t1_rob_head_ready;
@@ -764,8 +947,17 @@ module riscv64_ooo_proc #(
     wire [63:0] t1_rob_head2_value;
     wire t1_rob_head2_is_store, t1_rob_head2_is_ecall;
     wire t1_rob_commit_req2;
+    wire t1_rob_head3_ready;
+    wire [TB-1:0] t1_rob_head3_tag;
+    wire t1_rob_head3_has_dest;
+    wire [4:0] t1_rob_head3_rd;
+    wire [63:0] t1_rob_head3_value;
+    wire t1_rob_head3_is_store, t1_rob_head3_is_ecall;
+    wire t1_rob_commit_req3;
     wire t1_rob_rs1_done, t1_rob_rs2_done, t1_rob_rs1b_done, t1_rob_rs2b_done;
     wire [63:0] t1_rob_rs1_value, t1_rob_rs2_value, t1_rob_rs1b_value, t1_rob_rs2b_value;
+    wire t1_rob_rs1c_done, t1_rob_rs2c_done;
+    wire [63:0] t1_rob_rs1c_value, t1_rob_rs2c_value;
     wire t1_rob_ecc_sbe, t1_rob_ecc_dbe;
 
     rob #(.DEPTH(ROB_DEPTH), .EXTRA_MARK_N(LSQ_DEPTH), .VLEN(VLEN)) t1_rob_i (
@@ -776,8 +968,12 @@ module riscv64_ooo_proc #(
         .alloc2_req(t1_rob_alloc2_req), .alloc2_has_dest(t1_d1_reg_write), .alloc2_rd(t1_d1_rd),
         .alloc2_is_store(t1_d1_is_store), .alloc2_is_ecall(t1_d1_is_ecall), .alloc2_is_vec_dest(1'b0),
         .alloc2_tag(t1_rob_alloc2_tag), .free_count(t1_rob_free_count),
+        .alloc3_req(t1_rob_alloc3_req), .alloc3_has_dest(t1_d2_reg_write), .alloc3_rd(t1_d2_rd),
+        .alloc3_is_store(t1_d2_is_store), .alloc3_is_ecall(t1_d2_is_ecall), .alloc3_is_vec_dest(1'b0),
+        .alloc3_tag(t1_rob_alloc3_tag),
         .mark_valid(t1_rob_mark_valid), .mark_tag(t1_rob_mark_tag), .mark_value(t1_rob_mark_value),
         .mark_b_valid(t1_rob_mark_b_valid), .mark_b_tag(t1_rob_mark_b_tag), .mark_b_value(t1_rob_mark_b_value),
+        .mark_c_valid(t1_rob_mark_c_valid), .mark_c_tag(t1_rob_mark_c_tag), .mark_c_value(t1_rob_mark_c_value),
         .mark2_valid(t1_rob_mark2_valid), .mark2_tag(t1_rob_mark2_tag),
         .extra_mark_valid(t1_lsq_extra_mark_valid), .extra_mark_tag_flat(lsq_store_ready_tag_flat),
         .squash_valid(t1_mispredict), .squash_tag(t1_branch_resolved_tag),
@@ -785,6 +981,8 @@ module riscv64_ooo_proc #(
         .lookup2_tag(t1_rs2_tag), .lookup2_done(t1_rob_rs2_done), .lookup2_value(t1_rob_rs2_value),
         .lookup3_tag(t1_rs1b_tag_raw), .lookup3_done(t1_rob_rs1b_done), .lookup3_value(t1_rob_rs1b_value),
         .lookup4_tag(t1_rs2b_tag_raw), .lookup4_done(t1_rob_rs2b_done), .lookup4_value(t1_rob_rs2b_value),
+        .lookup5_tag(t1_rs1c_tag_raw), .lookup5_done(t1_rob_rs1c_done), .lookup5_value(t1_rob_rs1c_value),
+        .lookup6_tag(t1_rs2c_tag_raw), .lookup6_done(t1_rob_rs2c_done), .lookup6_value(t1_rob_rs2c_value),
         .head_ready(t1_rob_head_ready), .head_tag(t1_rob_head_tag), .head_has_dest(t1_rob_head_has_dest),
         .head_rd(t1_rob_head_rd), .head_value(t1_rob_head_value),
         .head_is_store(t1_rob_head_is_store), .head_is_ecall(t1_rob_head_is_ecall),
@@ -793,6 +991,10 @@ module riscv64_ooo_proc #(
         .head2_rd(t1_rob_head2_rd), .head2_value(t1_rob_head2_value),
         .head2_is_store(t1_rob_head2_is_store), .head2_is_ecall(t1_rob_head2_is_ecall),
         .commit_req2(t1_rob_commit_req2),
+        .head3_ready(t1_rob_head3_ready), .head3_tag(t1_rob_head3_tag), .head3_has_dest(t1_rob_head3_has_dest),
+        .head3_rd(t1_rob_head3_rd), .head3_value(t1_rob_head3_value),
+        .head3_is_store(t1_rob_head3_is_store), .head3_is_ecall(t1_rob_head3_is_ecall),
+        .commit_req3(t1_rob_commit_req3),
         .ecc_rob_sbe_fault(t1_rob_ecc_sbe), .ecc_rob_dbe_fault(t1_rob_ecc_dbe)
     );
 
@@ -804,29 +1006,42 @@ module riscv64_ooo_proc #(
     wire [63:0] rob_rs1b_value = active_thread ? t1_rob_rs1b_value : t0_rob_rs1b_value;
     wire rob_rs2b_done = active_thread ? t1_rob_rs2b_done : t0_rob_rs2b_done;
     wire [63:0] rob_rs2b_value = active_thread ? t1_rob_rs2b_value : t0_rob_rs2b_value;
+    wire rob_rs1c_done = active_thread ? t1_rob_rs1c_done : t0_rob_rs1c_done;
+    wire [63:0] rob_rs1c_value = active_thread ? t1_rob_rs1c_value : t0_rob_rs1c_value;
+    wire rob_rs2c_done = active_thread ? t1_rob_rs2c_done : t0_rob_rs2c_done;
+    wire [63:0] rob_rs2c_value = active_thread ? t1_rob_rs2c_value : t0_rob_rs2c_value;
 
     wire [TB-1:0] rob_alloc_tag  = active_thread ? t1_rob_alloc_tag  : t0_rob_alloc_tag;
     wire [TB-1:0] rob_alloc2_tag = active_thread ? t1_rob_alloc2_tag : t0_rob_alloc2_tag;
+    wire [TB-1:0] rob_alloc3_tag = active_thread ? t1_rob_alloc3_tag : t0_rob_alloc3_tag;
     wire [TB:0] rob_free_count   = active_thread ? t1_rob_free_count : t0_rob_free_count;
 
     // ================================================================
-    // ---- CDB arbiter (Phase 7: 6-way, is-own-thread-head-first) ----
+    // ---- CDB arbiter (Phase 16: 8-way, 3 picks/cycle, is-own-thread-head-
+    // first) ----
     // ================================================================
-    // Requesters: alu, t0's branch, t1's branch, mul, div, lsq. alu/mul/
-    // div/lsq are shared banks (their entries, and so their req_tid
-    // output, may belong to either thread); branch_rs is no longer a
-    // single shared requester now that it's two independent per-thread
-    // instances (see module header), so it contributes two fixed-tid
-    // requesters instead of one.
+    // Requesters: alu0/alu1/alu2 (Phase 16 widens alu_rs.v's own issue
+    // path to 3 ready-entry picks/cycle -- see its header -- so the ALU
+    // bank alone now contributes 3 independent requesters, not 1), t0's
+    // branch, t1's branch, mul, div, lsq. mul/div/lsq stay single-issue
+    // (see alu_rs.v/mul_rs.v/lsq.v headers for why only ALU got a wider
+    // issue path); their req_tid output, like alu's, may belong to either
+    // thread. branch_rs is two independent per-thread instances (see
+    // module header), so it contributes two fixed-tid requesters.
     //
     // Priority: a requester whose tag is its OWN thread's current ROB
     // head wins outright (this is what keeps in-order commit from ever
     // being needlessly delayed); otherwise fixed lowest-index order among
-    // {alu, t0_branch, t1_branch, mul, div, lsq}. This replaces Phase 1-6's
-    // plain age()-relative-to-head comparison, which has no honest
-    // definition across two independent ROBs' tag spaces -- exactly the
-    // same reasoning, and the same fallback scheme, as alu_rs.v's
-    // entry_is_head-based issue priority.
+    // {alu0, alu1, alu2, t0_branch, t1_branch, mul, div, lsq}. This
+    // replaces Phase 1-6's plain age()-relative-to-head comparison, which
+    // has no honest definition across two independent ROBs' tag spaces --
+    // exactly the same reasoning, and the same fallback scheme, as
+    // alu_rs.v's entry_is_head-based issue priority.
+    //
+    // Three picks/cycle: a third pass (ci below) re-runs the identical
+    // reduction with both idx_a and idx_b masked out of contention -- the
+    // same "find best of what's left" pattern alu_rs.v's own 3 issue picks
+    // now use internally.
     function is_head;
         input t;
         input [TB-1:0] tg;
@@ -835,22 +1050,30 @@ module riscv64_ooo_proc #(
         end
     endfunction
 
-    localparam NREQ = 6;
+    localparam NREQ = 8;
     reg          arb_v  [0:NREQ-1];
     reg          arb_t  [0:NREQ-1];
     reg [TB-1:0] arb_tg [0:NREQ-1];
     reg [63:0]   arb_vl [0:NREQ-1];
     always @(*) begin
+        // alu_rs's 3-way issue (req/req2/req3) all feed the arbiter
+        // unconditionally -- see ecall_halt0's header above for why this
+        // no longer needs throttling by ENABLE_TRIPLE_ISSUE: the actual
+        // race was in how a halt observer sampled architectural state
+        // relative to a predictive commit signal, not in how fast ALU
+        // results complete, so genuine full-rate 3-way issue is safe.
         arb_v[0]=alu_req_valid;       arb_t[0]=alu_req_tid;       arb_tg[0]=alu_req_tag;       arb_vl[0]=alu_req_value;
-        arb_v[1]=t0_branch_req_valid; arb_t[1]=1'b0;              arb_tg[1]=t0_branch_req_tag; arb_vl[1]=t0_branch_req_value;
-        arb_v[2]=t1_branch_req_valid; arb_t[2]=1'b1;              arb_tg[2]=t1_branch_req_tag; arb_vl[2]=t1_branch_req_value;
-        arb_v[3]=mul_req_valid;       arb_t[3]=mul_req_tid;       arb_tg[3]=mul_req_tag;       arb_vl[3]=mul_req_value;
-        arb_v[4]=div_req_valid;       arb_t[4]=div_req_tid;       arb_tg[4]=div_req_tag;       arb_vl[4]=div_req_value;
-        arb_v[5]=lsq_req_valid;       arb_t[5]=lsq_req_tid;       arb_tg[5]=lsq_req_tag;       arb_vl[5]=lsq_req_value;
+        arb_v[1]=alu_req2_valid;      arb_t[1]=alu_req2_tid;      arb_tg[1]=alu_req2_tag;      arb_vl[1]=alu_req2_value;
+        arb_v[2]=alu_req3_valid;      arb_t[2]=alu_req3_tid;      arb_tg[2]=alu_req3_tag;      arb_vl[2]=alu_req3_value;
+        arb_v[3]=t0_branch_req_valid; arb_t[3]=1'b0;              arb_tg[3]=t0_branch_req_tag; arb_vl[3]=t0_branch_req_value;
+        arb_v[4]=t1_branch_req_valid; arb_t[4]=1'b1;              arb_tg[4]=t1_branch_req_tag; arb_vl[4]=t1_branch_req_value;
+        arb_v[5]=mul_req_valid;       arb_t[5]=mul_req_tid;       arb_tg[5]=mul_req_tag;       arb_vl[5]=mul_req_value;
+        arb_v[6]=div_req_valid;       arb_t[6]=div_req_tid;       arb_tg[6]=div_req_tag;       arb_vl[6]=div_req_value;
+        arb_v[7]=lsq_req_valid;       arb_t[7]=lsq_req_tid;       arb_tg[7]=lsq_req_tag;       arb_vl[7]=lsq_req_value;
     end
 
     integer ai;
-    reg have_a; reg [2:0] idx_a; reg a_is_head;
+    reg have_a; reg [3:0] idx_a; reg a_is_head;
     always @(*) begin
         have_a = 1'b0; idx_a = 0; a_is_head = 1'b0;
         for (ai = 0; ai < NREQ; ai = ai + 1)
@@ -860,12 +1083,26 @@ module riscv64_ooo_proc #(
     end
 
     integer bi;
-    reg have_b; reg [2:0] idx_b; reg b_is_head;
+    reg have_b; reg [3:0] idx_b; reg b_is_head;
     always @(*) begin
         have_b = 1'b0; idx_b = 0; b_is_head = 1'b0;
         for (bi = 0; bi < NREQ; bi = bi + 1)
             if (arb_v[bi] && bi != idx_a && (!have_b || (is_head(arb_t[bi], arb_tg[bi]) && !b_is_head))) begin
                 have_b = 1'b1; idx_b = bi; b_is_head = is_head(arb_t[bi], arb_tg[bi]);
+            end
+    end
+
+    // Third pass of the same "find best of what's left" reduction --
+    // unconditional (see ecall_halt0's header for why this no longer
+    // needs to be throttled by ENABLE_TRIPLE_ISSUE).
+    integer ci;
+    reg have_c; reg [3:0] idx_c; reg c_is_head;
+    always @(*) begin
+        have_c = 1'b0; idx_c = 0; c_is_head = 1'b0;
+        for (ci = 0; ci < NREQ; ci = ci + 1)
+            if (arb_v[ci] && ci != idx_a && !(have_b && ci == idx_b) &&
+                (!have_c || (is_head(arb_t[ci], arb_tg[ci]) && !c_is_head))) begin
+                have_c = 1'b1; idx_c = ci; c_is_head = is_head(arb_t[ci], arb_tg[ci]);
             end
     end
 
@@ -879,22 +1116,32 @@ module riscv64_ooo_proc #(
     wire [63:0] cdbB_value = arb_vl[idx_b];
     wire cdbB_tid = arb_t[idx_b];
 
-    wire alu_grant       = (have_a && idx_a==0) || (have_b && idx_b==0);
-    wire t0_branch_grant = (have_a && idx_a==1) || (have_b && idx_b==1);
-    wire t1_branch_grant = (have_a && idx_a==2) || (have_b && idx_b==2);
-    wire mul_grant        = (have_a && idx_a==3) || (have_b && idx_b==3);
-    wire div_grant         = (have_a && idx_a==4) || (have_b && idx_b==4);
-    wire lsq_grant          = (have_a && idx_a==5) || (have_b && idx_b==5);
+    wire cdbC_valid = have_c;
+    wire [TB-1:0] cdbC_tag = arb_tg[idx_c];
+    wire [63:0] cdbC_value = arb_vl[idx_c];
+    wire cdbC_tid = arb_t[idx_c];
+
+    wire alu_grant        = (have_a && idx_a==0) || (have_b && idx_b==0) || (have_c && idx_c==0);
+    wire alu_grant2        = (have_a && idx_a==1) || (have_b && idx_b==1) || (have_c && idx_c==1);
+    wire alu_grant3        = (have_a && idx_a==2) || (have_b && idx_b==2) || (have_c && idx_c==2);
+    wire t0_branch_grant = (have_a && idx_a==3) || (have_b && idx_b==3) || (have_c && idx_c==3);
+    wire t1_branch_grant = (have_a && idx_a==4) || (have_b && idx_b==4) || (have_c && idx_c==4);
+    wire mul_grant        = (have_a && idx_a==5) || (have_b && idx_b==5) || (have_c && idx_c==5);
+    wire div_grant         = (have_a && idx_a==6) || (have_b && idx_b==6) || (have_c && idx_c==6);
+    wire lsq_grant          = (have_a && idx_a==7) || (have_b && idx_b==7) || (have_c && idx_c==7);
 
     // Route each CDB winner to the correct thread's ROB via its tid,
-    // reusing the existing dual mark/mark_b ports -- no new ROB ports
-    // needed.
+    // reusing the existing triple mark/mark_b/mark_c ports -- no new ROB
+    // ports needed.
     assign t0_rob_mark_valid   = cdbA_valid && !cdbA_tid;
     assign t0_rob_mark_tag     = cdbA_tag;
     assign t0_rob_mark_value   = cdbA_value;
     assign t0_rob_mark_b_valid = cdbB_valid && !cdbB_tid;
     assign t0_rob_mark_b_tag   = cdbB_tag;
     assign t0_rob_mark_b_value = cdbB_value;
+    assign t0_rob_mark_c_valid = cdbC_valid && !cdbC_tid;
+    assign t0_rob_mark_c_tag   = cdbC_tag;
+    assign t0_rob_mark_c_value = cdbC_value;
 
     assign t1_rob_mark_valid   = cdbA_valid && cdbA_tid;
     assign t1_rob_mark_tag     = cdbA_tag;
@@ -902,6 +1149,9 @@ module riscv64_ooo_proc #(
     assign t1_rob_mark_b_valid = cdbB_valid && cdbB_tid;
     assign t1_rob_mark_b_tag   = cdbB_tag;
     assign t1_rob_mark_b_value = cdbB_value;
+    assign t1_rob_mark_c_valid = cdbC_valid && cdbC_tid;
+    assign t1_rob_mark_c_tag   = cdbC_tag;
+    assign t1_rob_mark_c_value = cdbC_value;
 
     // ---- Vector reservation station + functional unit (Phase 6, DLP) ------
     // Thread-0-only throughout (see module header): rob_head_tag/squash
@@ -964,10 +1214,19 @@ module riscv64_ooo_proc #(
     assign vec_write_en   = lane0_fire && d0_is_vec;
 
     // ---- ALU reservation-station bank + functional unit (shared, tagged) --
-    wire alu_rs_full, alu_rs_has_2_free;
+    // Phase 16: 3-wide allocation (lane 2 added) and 3-wide issue (req2/
+    // req3, see alu_rs.v's own header for why only this bank got a wider
+    // issue path).
+    wire alu_rs_full, alu_rs_has_2_free, alu_rs_has_3_free;
     wire alu_req_valid, alu_req_tid;
     wire [TB-1:0] alu_req_tag;
     wire [63:0] alu_req_value;
+    wire alu_req2_valid, alu_req2_tid;
+    wire [TB-1:0] alu_req2_tag;
+    wire [63:0] alu_req2_value;
+    wire alu_req3_valid, alu_req3_tid;
+    wire [TB-1:0] alu_req3_tag;
+    wire [63:0] alu_req3_value;
 
     alu_rs #(.DEPTH(ALU_RS_DEPTH), .TAG_BITS(TB)) alu_rs_i (
         .clk(clk), .reset(reset),
@@ -983,17 +1242,28 @@ module riscv64_ooo_proc #(
         .alloc2_src2_ready(lane1_src2_ready), .alloc2_src2_val(lane1_src2_val), .alloc2_src2_tag(lane1_src2_tag),
         .alloc2_dest_tag(rob_alloc2_tag),
         .has_2_free(alu_rs_has_2_free),
+        .alloc3_req(lane2_fire && d2_is_alu), .alloc3_tid(active_thread),
+        .alloc3_op(d2_alu_op), .alloc3_word_op(d2_word_op),
+        .alloc3_src1_ready(lane2_src1_ready), .alloc3_src1_val(lane2_src1_val), .alloc3_src1_tag(lane2_src1_tag),
+        .alloc3_src2_ready(lane2_src2_ready), .alloc3_src2_val(lane2_src2_val), .alloc3_src2_tag(lane2_src2_tag),
+        .alloc3_dest_tag(rob_alloc3_tag),
+        .has_3_free(alu_rs_has_3_free),
         .cdbA_valid(cdbA_valid), .cdbA_tid(cdbA_tid), .cdbA_tag(cdbA_tag), .cdbA_value(cdbA_value),
         .cdbB_valid(cdbB_valid), .cdbB_tid(cdbB_tid), .cdbB_tag(cdbB_tag), .cdbB_value(cdbB_value),
+        .cdbC_valid(cdbC_valid), .cdbC_tid(cdbC_tid), .cdbC_tag(cdbC_tag), .cdbC_value(cdbC_value),
         .req_valid(alu_req_valid), .req_tid(alu_req_tid), .req_tag(alu_req_tag), .req_value(alu_req_value),
         .req_grant(alu_grant),
+        .req2_valid(alu_req2_valid), .req2_tid(alu_req2_tid), .req2_tag(alu_req2_tag), .req2_value(alu_req2_value),
+        .req2_grant(alu_grant2),
+        .req3_valid(alu_req3_valid), .req3_tid(alu_req3_tid), .req3_tag(alu_req3_tag), .req3_value(alu_req3_value),
+        .req3_grant(alu_grant3),
         .rob_head_tag0(t0_rob_head_tag), .rob_head_tag1(t1_rob_head_tag),
         .squash0_valid(t0_mispredict), .squash0_tag(t0_branch_resolved_tag),
         .squash1_valid(t1_mispredict), .squash1_tag(t1_branch_resolved_tag)
     );
 
     // ---- Multiply reservation-station bank + functional unit (shared) -----
-    wire mul_rs_full, mul_rs_has_2_free;
+    wire mul_rs_full, mul_rs_has_2_free, mul_rs_has_3_free;
     wire mul_req_valid, mul_req_tid;
     wire [TB-1:0] mul_req_tag;
     wire [63:0] mul_req_value;
@@ -1012,8 +1282,15 @@ module riscv64_ooo_proc #(
         .alloc2_src2_ready(lane1_src2_ready), .alloc2_src2_val(lane1_src2_val), .alloc2_src2_tag(lane1_src2_tag),
         .alloc2_dest_tag(rob_alloc2_tag),
         .has_2_free(mul_rs_has_2_free),
+        .alloc3_req(lane2_fire && d2_is_mul), .alloc3_tid(active_thread),
+        .alloc3_op(d2_muldiv_op), .alloc3_word_op(d2_word_op),
+        .alloc3_src1_ready(lane2_src1_ready), .alloc3_src1_val(lane2_src1_val), .alloc3_src1_tag(lane2_src1_tag),
+        .alloc3_src2_ready(lane2_src2_ready), .alloc3_src2_val(lane2_src2_val), .alloc3_src2_tag(lane2_src2_tag),
+        .alloc3_dest_tag(rob_alloc3_tag),
+        .has_3_free(mul_rs_has_3_free),
         .cdbA_valid(cdbA_valid), .cdbA_tid(cdbA_tid), .cdbA_tag(cdbA_tag), .cdbA_value(cdbA_value),
         .cdbB_valid(cdbB_valid), .cdbB_tid(cdbB_tid), .cdbB_tag(cdbB_tag), .cdbB_value(cdbB_value),
+        .cdbC_valid(cdbC_valid), .cdbC_tid(cdbC_tid), .cdbC_tag(cdbC_tag), .cdbC_value(cdbC_value),
         .req_valid(mul_req_valid), .req_tid(mul_req_tid), .req_tag(mul_req_tag), .req_value(mul_req_value),
         .req_grant(mul_grant),
         .rob_head_tag0(t0_rob_head_tag), .rob_head_tag1(t1_rob_head_tag),
@@ -1029,22 +1306,24 @@ module riscv64_ooo_proc #(
 
     wire div_from_lane0 = lane0_fire && d0_is_div;
     wire div_from_lane1 = lane1_fire && d1_is_div;
+    wire div_from_lane2 = lane2_fire && d2_is_div;
 
     div_rs #(.TAG_BITS(TB)) div_rs_i (
         .clk(clk), .reset(reset),
-        .alloc_req(div_from_lane0 || div_from_lane1), .alloc_tid(active_thread),
-        .alloc_op(div_from_lane0 ? d0_muldiv_op : d1_muldiv_op),
-        .alloc_word_op(div_from_lane0 ? d0_word_op : d1_word_op),
-        .alloc_src1_ready(div_from_lane0 ? lane0_src1_ready : lane1_src1_ready),
-        .alloc_src1_val(div_from_lane0 ? lane0_src1_val : lane1_src1_val),
-        .alloc_src1_tag(div_from_lane0 ? rs1_tag : lane1_src1_tag),
-        .alloc_src2_ready(div_from_lane0 ? lane0_src2_ready : lane1_src2_ready),
-        .alloc_src2_val(div_from_lane0 ? lane0_src2_val : lane1_src2_val),
-        .alloc_src2_tag(div_from_lane0 ? rs2_tag : lane1_src2_tag),
-        .alloc_dest_tag(div_from_lane0 ? rob_alloc_tag : rob_alloc2_tag),
+        .alloc_req(div_from_lane0 || div_from_lane1 || div_from_lane2), .alloc_tid(active_thread),
+        .alloc_op(div_from_lane0 ? d0_muldiv_op : div_from_lane1 ? d1_muldiv_op : d2_muldiv_op),
+        .alloc_word_op(div_from_lane0 ? d0_word_op : div_from_lane1 ? d1_word_op : d2_word_op),
+        .alloc_src1_ready(div_from_lane0 ? lane0_src1_ready : div_from_lane1 ? lane1_src1_ready : lane2_src1_ready),
+        .alloc_src1_val(div_from_lane0 ? lane0_src1_val : div_from_lane1 ? lane1_src1_val : lane2_src1_val),
+        .alloc_src1_tag(div_from_lane0 ? rs1_tag : div_from_lane1 ? lane1_src1_tag : lane2_src1_tag),
+        .alloc_src2_ready(div_from_lane0 ? lane0_src2_ready : div_from_lane1 ? lane1_src2_ready : lane2_src2_ready),
+        .alloc_src2_val(div_from_lane0 ? lane0_src2_val : div_from_lane1 ? lane1_src2_val : lane2_src2_val),
+        .alloc_src2_tag(div_from_lane0 ? rs2_tag : div_from_lane1 ? lane1_src2_tag : lane2_src2_tag),
+        .alloc_dest_tag(div_from_lane0 ? rob_alloc_tag : div_from_lane1 ? rob_alloc2_tag : rob_alloc3_tag),
         .full(div_rs_full),
         .cdbA_valid(cdbA_valid), .cdbA_tid(cdbA_tid), .cdbA_tag(cdbA_tag), .cdbA_value(cdbA_value),
         .cdbB_valid(cdbB_valid), .cdbB_tid(cdbB_tid), .cdbB_tag(cdbB_tag), .cdbB_value(cdbB_value),
+        .cdbC_valid(cdbC_valid), .cdbC_tid(cdbC_tid), .cdbC_tag(cdbC_tag), .cdbC_value(cdbC_value),
         .req_valid(div_req_valid), .req_tid(div_req_tid), .req_tag(div_req_tag), .req_value(div_req_value),
         .req_grant(div_grant),
         .rob_head_tag0(t0_rob_head_tag), .rob_head_tag1(t1_rob_head_tag),
@@ -1053,7 +1332,7 @@ module riscv64_ooo_proc #(
     );
 
     // ---- Load-Store Queue + private L1 cache (shared across threads, tagged)
-    wire lsq_full, lsq_has_2_free;
+    wire lsq_full, lsq_has_2_free, lsq_has_3_free;
     wire lsq_req_valid, lsq_req_tid;
     wire [TB-1:0] lsq_req_tag;
     wire [63:0] lsq_req_value;
@@ -1065,6 +1344,7 @@ module riscv64_ooo_proc #(
 
     wire lane0_data_ready = d0_is_load || lane0_src2_ready;
     wire lane1_data_ready = d1_is_load || lane1_src2_ready;
+    wire lane2_data_ready = d2_is_load || lane2_src2_ready;
 
     // ---- Phase 8: private L1 data cache (one per core, shared by both
     // SMT threads -- like the shared RS banks, distinguished only by the
@@ -1111,8 +1391,15 @@ module riscv64_ooo_proc #(
         .alloc2_data_ready(lane1_data_ready), .alloc2_data_val(lane1_src2_val), .alloc2_data_tag(lane1_src2_tag),
         .alloc2_dest_tag(rob_alloc2_tag),
         .has_2_free(lsq_has_2_free),
+        .alloc3_req(lane2_fire && (d2_is_load || d2_is_store)), .alloc3_tid(active_thread),
+        .alloc3_is_store(d2_is_store), .alloc3_func3(d2_func3), .alloc3_imm(d2_imm),
+        .alloc3_base_ready(lane2_src1_ready), .alloc3_base_val(lane2_src1_val), .alloc3_base_tag(lane2_src1_tag),
+        .alloc3_data_ready(lane2_data_ready), .alloc3_data_val(lane2_src2_val), .alloc3_data_tag(lane2_src2_tag),
+        .alloc3_dest_tag(rob_alloc3_tag),
+        .has_3_free(lsq_has_3_free),
         .cdbA_valid(cdbA_valid), .cdbA_tid(cdbA_tid), .cdbA_tag(cdbA_tag), .cdbA_value(cdbA_value),
         .cdbB_valid(cdbB_valid), .cdbB_tid(cdbB_tid), .cdbB_tag(cdbB_tag), .cdbB_value(cdbB_value),
+        .cdbC_valid(cdbC_valid), .cdbC_tid(cdbC_tid), .cdbC_tag(cdbC_tag), .cdbC_value(cdbC_value),
         .rob_head_tag0(t0_rob_head_tag), .rob_head_tag1(t1_rob_head_tag),
         .commit_lookup_tid(commit_lookup_tid), .commit_lookup_tag(commit_lookup_tag),
         .req_valid(lsq_req_valid), .req_tid(lsq_req_tid), .req_tag(lsq_req_tag), .req_value(lsq_req_value),
@@ -1174,59 +1461,106 @@ module riscv64_ooo_proc #(
     wire t0_head1_sbuf_block = t0_head_wants_store && !sbuf_ok;
     wire t0_head2_sbuf_block = t0_head2_wants_store_cand && !sbuf_ok;
     assign t0_rob_commit_req  = t0_rob_head_ready && !t0_head1_sbuf_block;
-    assign t0_rob_commit_req2 = t0_rob_commit_req && t0_rob_head2_ready && !t0_commit2_store_conflict &&
+    // An ecall retiring at head must be a same-cycle commit barrier: fetch
+    // never stops at ecall (nothing squashes the speculatively-fetched
+    // stream past it), so whatever code happens to sit right after it in
+    // the binary -- e.g. this project's own fail-handler epilogues -- is
+    // already sitting in the ROB as head2/head3 by the time ecall reaches
+    // head. Without this gate, head2 (and, transitively, head3 below)
+    // would retire in the very same cycle as the ecall and could stomp
+    // architectural state (e.g. x31) the instant after it was correctly
+    // set, one cycle before any halt observer even gets to look at it --
+    // this, not the halt signal's own sampling edge, was the real race.
+    assign t0_rob_commit_req2 = t0_rob_commit_req && !t0_rob_head_is_ecall && t0_rob_head2_ready && !t0_commit2_store_conflict &&
                                  !t0_commit2_vec_conflict && !t0_head2_sbuf_block;
+
+    // Phase 16: head3's own conflict checks. Reached only when commit_req2
+    // is already true (see commit_req3's own && chain below), which itself
+    // already guarantees NOT(head_is_store && head2_is_store) -- so at
+    // most one of {head, head2} can be a store by the time head3 is even
+    // considered, and checking "does either of them want the store port"
+    // is exactly equivalent to, but simpler than, re-deriving which one.
+    wire t0_commit3_store_conflict = (t0_rob_head_is_store || t0_rob_head2_is_store) && t0_rob_head3_is_store;
+    wire t0_commit3_vec_conflict   = (t0_rob_head_is_vec_dest || t0_rob_head2_is_vec_dest) && t0_rob_head3_is_vec_dest;
+    wire t0_head3_wants_store_cand = t0_rob_head3_ready && !t0_commit3_store_conflict && t0_rob_head3_is_store;
+    wire t0_head3_sbuf_block = t0_head3_wants_store_cand && !sbuf_ok;
+    // Same ecall-is-a-commit-barrier gate as commit_req2 above (head2's own
+    // !t0_rob_head_is_ecall term already propagates transitively through
+    // commit_req2, but head2 itself being the ecall must separately stop
+    // head3 from retiring alongside it).
+    assign t0_rob_commit_req3 = t0_rob_commit_req2 && !t0_rob_head2_is_ecall && t0_rob_head3_ready && !t0_commit3_store_conflict &&
+                                 !t0_commit3_vec_conflict && !t0_head3_sbuf_block;
 
     wire t0_commit_store_is_head1 = t0_rob_commit_req  && t0_rob_head_is_store;
     wire t0_commit_store_is_head2 = t0_rob_commit_req2 && t0_rob_head2_is_store;
-    wire t0_wants_store = t0_commit_store_is_head1 || t0_commit_store_is_head2;
+    wire t0_commit_store_is_head3 = t0_rob_commit_req3 && t0_rob_head3_is_store;
+    wire t0_wants_store = t0_commit_store_is_head1 || t0_commit_store_is_head2 || t0_commit_store_is_head3;
 
     wire t1_commit2_store_conflict = t1_rob_head_is_store && t1_rob_head2_is_store;
     wire t1_commit_store_is_head1_cand = t1_rob_head_ready  && t1_rob_head_is_store;
     wire t1_commit_store_is_head2_cand = t1_rob_head2_ready && !t1_commit2_store_conflict && t1_rob_head2_is_store;
-    wire t1_wants_store_cand = t1_commit_store_is_head1_cand || t1_commit_store_is_head2_cand;
+    wire t1_commit3_store_conflict = (t1_rob_head_is_store || t1_rob_head2_is_store) && t1_rob_head3_is_store;
+    wire t1_commit_store_is_head3_cand = t1_rob_head3_ready && !t1_commit3_store_conflict && t1_rob_head3_is_store;
+    wire t1_wants_store_cand = t1_commit_store_is_head1_cand || t1_commit_store_is_head2_cand || t1_commit_store_is_head3_cand;
 
     wire t1_blocked_by_t0_or_sbuf = t1_wants_store_cand && (t0_wants_store || !sbuf_ok);
     wire t1_head1_store_blocked = t1_commit_store_is_head1_cand && t1_blocked_by_t0_or_sbuf;
     wire t1_head2_store_blocked = t1_commit_store_is_head2_cand && t1_blocked_by_t0_or_sbuf;
+    wire t1_head3_store_blocked = t1_commit_store_is_head3_cand && t1_blocked_by_t0_or_sbuf;
 
     // Same do_commit1-equivalent gate as t0's fix above (t1_rob_commit_req
     // already folds in the cross-thread store-port block, so requiring it
-    // here also correctly withholds head2's commit whenever head1 lost
-    // that arbitration).
+    // here also correctly withholds head2's/head3's commit whenever an
+    // earlier head lost that arbitration). Also mirrors t0's ecall-is-a-
+    // commit-barrier gate -- see t0_rob_commit_req2's header above for why.
     assign t1_rob_commit_req  = t1_rob_head_ready && !t1_head1_store_blocked;
-    assign t1_rob_commit_req2 = t1_rob_commit_req && t1_rob_head2_ready && !t1_commit2_store_conflict && !t1_head2_store_blocked;
+    assign t1_rob_commit_req2 = t1_rob_commit_req && !t1_rob_head_is_ecall && t1_rob_head2_ready && !t1_commit2_store_conflict && !t1_head2_store_blocked;
+    assign t1_rob_commit_req3 = t1_rob_commit_req2 && !t1_rob_head2_is_ecall && t1_rob_head3_ready && !t1_commit3_store_conflict && !t1_head3_store_blocked;
 
     wire t1_commit_store_is_head1 = t1_rob_commit_req  && t1_rob_head_is_store;
     wire t1_commit_store_is_head2 = t1_rob_commit_req2 && t1_rob_head2_is_store;
+    wire t1_commit_store_is_head3 = t1_rob_commit_req3 && t1_rob_head3_is_store;
 
-    // At most one of these four is ever true, by construction (intra-thread
-    // conflicts already prevent a thread's own head+head2 both being
-    // stores; the cross-thread arbiter above ensures at most one thread
-    // wins the single commit_fire port, gated on the store buffer actually
-    // having room).
-    wire lsq_commit_fire = t0_commit_store_is_head1 || t0_commit_store_is_head2 ||
-                            t1_commit_store_is_head1 || t1_commit_store_is_head2;
+    // At most one of these six is ever true, by construction (intra-thread
+    // conflicts already prevent more than one of a thread's own head/
+    // head2/head3 being a store in the same cycle; the cross-thread
+    // arbiter above ensures at most one thread wins the single commit_fire
+    // port, gated on the store buffer actually having room).
+    wire lsq_commit_fire = t0_commit_store_is_head1 || t0_commit_store_is_head2 || t0_commit_store_is_head3 ||
+                            t1_commit_store_is_head1 || t1_commit_store_is_head2 || t1_commit_store_is_head3;
     wire commit_lookup_tid = t0_commit_store_is_head1 ? 1'b0 :
                               t0_commit_store_is_head2 ? 1'b0 :
+                              t0_commit_store_is_head3 ? 1'b0 :
                               t1_commit_store_is_head1 ? 1'b1 :
-                              t1_commit_store_is_head2 ? 1'b1 : 1'b0;
+                              t1_commit_store_is_head2 ? 1'b1 :
+                              t1_commit_store_is_head3 ? 1'b1 : 1'b0;
     wire [TB-1:0] commit_lookup_tag = t0_commit_store_is_head1 ? t0_rob_head_tag :
                                        t0_commit_store_is_head2 ? t0_rob_head2_tag :
+                                       t0_commit_store_is_head3 ? t0_rob_head3_tag :
                                        t1_commit_store_is_head1 ? t1_rob_head_tag :
-                                       t1_commit_store_is_head2 ? t1_rob_head2_tag : {TB{1'b0}};
+                                       t1_commit_store_is_head2 ? t1_rob_head2_tag :
+                                       t1_commit_store_is_head3 ? t1_rob_head3_tag : {TB{1'b0}};
 
     // Vector commit writeback: thread-0-only, so no cross-thread conflict is
     // possible -- mirrors the (single-thread) store-conflict pattern above,
-    // targeting vector_register_file.v's single write port.
+    // targeting vector_register_file.v's single write port. head2/head3 can
+    // never actually be vec-dest (only lane 0 ever dispatches a vector
+    // instruction -- alloc2_is_vec_dest/alloc3_is_vec_dest are hardwired 0
+    // at t0_rob_i's own instantiation), so the head2/head3 arms below are
+    // dead in practice; kept for the same defensive symmetry as the store
+    // conflict checks, in case that scope line ever changes.
     wire t0_commit_vec_is_head1 = t0_rob_commit_req  && t0_rob_head_is_vec_dest;
     wire t0_commit_vec_is_head2 = t0_rob_commit_req2 && t0_rob_head2_is_vec_dest;
-    assign vec_commit_write_en_w   = t0_commit_vec_is_head1 || t0_commit_vec_is_head2;
-    assign vec_commit_write_reg_w  = t0_commit_vec_is_head1 ? t0_rob_head_rd : t0_rob_head2_rd;
-    assign vec_commit_write_data_w = t0_commit_vec_is_head1 ? t0_rob_head_vec_value : t0_rob_head2_vec_value;
+    wire t0_commit_vec_is_head3 = t0_rob_commit_req3 && t0_rob_head3_is_vec_dest;
+    assign vec_commit_write_en_w   = t0_commit_vec_is_head1 || t0_commit_vec_is_head2 || t0_commit_vec_is_head3;
+    assign vec_commit_write_reg_w  = t0_commit_vec_is_head1 ? t0_rob_head_rd :
+                                      t0_commit_vec_is_head2 ? t0_rob_head2_rd : t0_rob_head3_rd;
+    assign vec_commit_write_data_w = t0_commit_vec_is_head1 ? t0_rob_head_vec_value :
+                                      t0_commit_vec_is_head2 ? t0_rob_head2_vec_value : t0_rob_head3_vec_value;
     assign vec_commit_clear_en_w   = vec_commit_write_en_w;
     assign vec_commit_clear_rd_w   = vec_commit_write_reg_w;
-    assign vec_commit_clear_tag_w  = t0_commit_vec_is_head1 ? t0_rob_head_tag : t0_rob_head2_tag;
+    assign vec_commit_clear_tag_w  = t0_commit_vec_is_head1 ? t0_rob_head_tag :
+                                      t0_commit_vec_is_head2 ? t0_rob_head2_tag : t0_rob_head3_tag;
 
     // ================================================================
     // ---- Branch-class reservation stations (per thread) -------------
@@ -1265,6 +1599,7 @@ module riscv64_ooo_proc #(
         .full(t0_branch_rs_full),
         .cdbA_valid(cdbA_valid), .cdbA_tid(cdbA_tid), .cdbA_tag(cdbA_tag), .cdbA_value(cdbA_value),
         .cdbB_valid(cdbB_valid), .cdbB_tid(cdbB_tid), .cdbB_tag(cdbB_tag), .cdbB_value(cdbB_value),
+        .cdbC_valid(cdbC_valid), .cdbC_tid(cdbC_tid), .cdbC_tag(cdbC_tag), .cdbC_value(cdbC_value),
         .resolved(t0_branch_resolved), .resolved_next_pc(t0_branch_resolved_next_pc),
         .resolved_tag(t0_branch_resolved_tag), .resolved_has_result(t0_branch_resolved_has_result),
         .resolved_pc(t0_branch_resolved_pc), .resolved_taken(t0_branch_resolved_taken),
@@ -1299,6 +1634,7 @@ module riscv64_ooo_proc #(
         .full(t1_branch_rs_full),
         .cdbA_valid(cdbA_valid), .cdbA_tid(cdbA_tid), .cdbA_tag(cdbA_tag), .cdbA_value(cdbA_value),
         .cdbB_valid(cdbB_valid), .cdbB_tid(cdbB_tid), .cdbB_tag(cdbB_tag), .cdbB_value(cdbB_value),
+        .cdbC_valid(cdbC_valid), .cdbC_tid(cdbC_tid), .cdbC_tag(cdbC_tag), .cdbC_value(cdbC_value),
         .resolved(t1_branch_resolved), .resolved_next_pc(t1_branch_resolved_next_pc),
         .resolved_tag(t1_branch_resolved_tag), .resolved_has_result(t1_branch_resolved_has_result),
         .resolved_pc(t1_branch_resolved_pc), .resolved_taken(t1_branch_resolved_taken),
@@ -1347,6 +1683,23 @@ module riscv64_ooo_proc #(
         .update_taken(bht_update_use_t0 ? t0_branch_resolved_taken : t1_branch_resolved_taken)
     );
 
+    // Phase 17: BTB -- single shared instance (see btb.v's header),
+    // scoped to non-return indirect JALR target prediction only. Reads
+    // the same muxed, latched `pc` BHT already does; training/mispredict
+    // wiring lives further down, next to the RAS/spec-window logic it
+    // plugs into as an alternative prediction source.
+    wire btb_predict_valid;
+    wire [63:0] btb_predict_target;
+    wire t0_btb_train_valid, t1_btb_train_valid;
+    wire btb_train_use_t0 = t0_btb_train_valid;
+    btb btb_i (
+        .clk(clk), .reset(reset),
+        .predict_pc(pc), .predict_valid(btb_predict_valid), .predict_target(btb_predict_target),
+        .update_valid(t0_btb_train_valid || t1_btb_train_valid),
+        .update_pc(btb_train_use_t0 ? t0_branch_resolved_pc : t1_branch_resolved_pc),
+        .update_target(btb_train_use_t0 ? t0_branch_resolved_next_pc : t1_branch_resolved_next_pc)
+    );
+
     // ---- Phase 13: Return Address Stack (per thread) -----------------------
     // Call/return classification off the shared, active-thread-muxed decode
     // fields -- see ras.v's header for why a plain per-thread LIFO needs no
@@ -1387,8 +1740,25 @@ module riscv64_ooo_proc #(
         .pop_req(t1_ras_pop_req)
     );
 
+    // Phase 17: BTB-predicted non-return JALR -- keyed off !t0_ras_pop_req
+    // (not !ras_pop_it), the exact condition t0_jalr_stall_active itself
+    // arms on below, so this also covers the RAS-present-but-empty
+    // fallback case (deep/mismatched call nesting past RAS_DEPTH) for
+    // free. btb_predict_valid is a single shared, PC-indexed lookup (see
+    // btb_i above) -- safe to read from both threads' request wires the
+    // same cycle since only the active thread's lane0_fire can be true.
+    wire t0_btb_predict_req = (active_thread == 1'b0) && lane0_fire && d0_is_jalr && !t0_ras_pop_req && btb_predict_valid;
+    wire t1_btb_predict_req = (active_thread == 1'b1) && lane0_fire && d0_is_jalr && !t1_ras_pop_req && btb_predict_valid;
+
     reg t0_spec_active;
-    reg t0_spec_is_jalr;              // Phase 13: which prediction source (BHT direction vs RAS target) this speculative window came from
+    reg t0_spec_is_jalr;              // Phase 13: which prediction source (BHT direction vs RAS/BTB target) this speculative window came from
+    // Phase 17: RAS and BTB predictions both set spec_is_jalr=1, so this
+    // second bit is needed at resolution time to tell them apart for
+    // training purposes (see t0_btb_train_valid below) -- misprediction
+    // *detection* itself needs no such distinction (t0_mispredict's
+    // compare is already generic over how t0_predicted_target_reg got
+    // set).
+    reg t0_spec_src_is_btb;
     reg t0_predicted_taken_reg;
     reg [63:0] t0_predicted_target_reg;
     always @(posedge clk or posedge reset) begin
@@ -1397,11 +1767,18 @@ module riscv64_ooo_proc #(
         end else if ((active_thread == 1'b0) && lane0_fire && d0_is_branch) begin
             t0_spec_active <= 1'b1;
             t0_spec_is_jalr <= 1'b0;
+            t0_spec_src_is_btb <= 1'b0;
             t0_predicted_taken_reg <= bht_predict_taken;
         end else if (t0_ras_pop_req) begin
             t0_spec_active <= 1'b1;
             t0_spec_is_jalr <= 1'b1;
+            t0_spec_src_is_btb <= 1'b0;
             t0_predicted_target_reg <= t0_ras_top_addr;
+        end else if (t0_btb_predict_req) begin
+            t0_spec_active <= 1'b1;
+            t0_spec_is_jalr <= 1'b1;
+            t0_spec_src_is_btb <= 1'b1;
+            t0_predicted_target_reg <= btb_predict_target;
         end else if (t0_branch_resolved) begin
             t0_spec_active <= 1'b0;
         end
@@ -1410,15 +1787,26 @@ module riscv64_ooo_proc #(
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             t0_jalr_stall_active <= 1'b0;
-        end else if ((active_thread == 1'b0) && lane0_fire && d0_is_jalr && !t0_ras_pop_req) begin
+        end else if ((active_thread == 1'b0) && lane0_fire && d0_is_jalr && !t0_ras_pop_req && !t0_btb_predict_req) begin
             t0_jalr_stall_active <= 1'b1;
         end else if (t0_branch_resolved) begin
             t0_jalr_stall_active <= 1'b0;
         end
     end
 
+    // Phase 17: trains on every resolved non-RAS JALR -- both a BTB hit
+    // that just got confirmed/denied, and a previously-cold-stalled JALR
+    // (t0_spec_active=0, nothing to disambiguate) -- excluding only a
+    // genuine RAS-sourced prediction. This also trains on the RAS-
+    // present-but-empty fallback case (t0_ras_pop_req=0 despite
+    // ras_pop_it=1), which is harmless and self-healing.
+    wire t0_branch_resolved_is_jalr = t0_branch_resolved && t0_branch_resident_is_jalr;
+    assign t0_btb_train_valid = t0_branch_resolved_is_jalr &&
+        !(t0_spec_active && t0_spec_is_jalr && !t0_spec_src_is_btb);
+
     reg t1_spec_active;
     reg t1_spec_is_jalr;
+    reg t1_spec_src_is_btb;
     reg t1_predicted_taken_reg;
     reg [63:0] t1_predicted_target_reg;
     always @(posedge clk or posedge reset) begin
@@ -1427,11 +1815,18 @@ module riscv64_ooo_proc #(
         end else if ((active_thread == 1'b1) && lane0_fire && d0_is_branch) begin
             t1_spec_active <= 1'b1;
             t1_spec_is_jalr <= 1'b0;
+            t1_spec_src_is_btb <= 1'b0;
             t1_predicted_taken_reg <= bht_predict_taken;
         end else if (t1_ras_pop_req) begin
             t1_spec_active <= 1'b1;
             t1_spec_is_jalr <= 1'b1;
+            t1_spec_src_is_btb <= 1'b0;
             t1_predicted_target_reg <= t1_ras_top_addr;
+        end else if (t1_btb_predict_req) begin
+            t1_spec_active <= 1'b1;
+            t1_spec_is_jalr <= 1'b1;
+            t1_spec_src_is_btb <= 1'b1;
+            t1_predicted_target_reg <= btb_predict_target;
         end else if (t1_branch_resolved) begin
             t1_spec_active <= 1'b0;
         end
@@ -1440,12 +1835,16 @@ module riscv64_ooo_proc #(
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             t1_jalr_stall_active <= 1'b0;
-        end else if ((active_thread == 1'b1) && lane0_fire && d0_is_jalr && !t1_ras_pop_req) begin
+        end else if ((active_thread == 1'b1) && lane0_fire && d0_is_jalr && !t1_ras_pop_req && !t1_btb_predict_req) begin
             t1_jalr_stall_active <= 1'b1;
         end else if (t1_branch_resolved) begin
             t1_jalr_stall_active <= 1'b0;
         end
     end
+
+    wire t1_branch_resolved_is_jalr = t1_branch_resolved && t1_branch_resident_is_jalr;
+    assign t1_btb_train_valid = t1_branch_resolved_is_jalr &&
+        !(t1_spec_active && t1_spec_is_jalr && !t1_spec_src_is_btb);
 
     wire t0_mispredict = t0_spec_active && t0_branch_resolved &&
         (t0_spec_is_jalr ? (t0_branch_resolved_next_pc != t0_predicted_target_reg)
@@ -1460,9 +1859,10 @@ module riscv64_ooo_proc #(
 
     // Phase 13: also checkpoint on a RAS-predicted return, not just a
     // conditional branch -- that's now a second source of speculation
-    // needing the same rollback-on-misprediction support.
-    wire t0_rat_checkpoint_save = (active_thread == 1'b0) && lane0_fire && (d0_is_branch || t0_ras_pop_req);
-    wire t1_rat_checkpoint_save = (active_thread == 1'b1) && lane0_fire && (d0_is_branch || t1_ras_pop_req);
+    // needing the same rollback-on-misprediction support. Phase 17: a
+    // BTB-predicted JALR is a third.
+    wire t0_rat_checkpoint_save = (active_thread == 1'b0) && lane0_fire && (d0_is_branch || t0_ras_pop_req || t0_btb_predict_req);
+    wire t1_rat_checkpoint_save = (active_thread == 1'b1) && lane0_fire && (d0_is_branch || t1_ras_pop_req || t1_btb_predict_req);
 
     wire t0_redirect_needed = t0_mispredict || (t0_jalr_stall_active && t0_branch_resolved);
     wire t1_redirect_needed = t1_mispredict || (t1_jalr_stall_active && t1_branch_resolved);
@@ -1488,7 +1888,7 @@ module riscv64_ooo_proc #(
     // lane1_fire already depends on lane0_fire, so gating here alone is
     // enough for both lanes.
     wire lane0_fire = lane0_dispatchable && (rob_free_count >= 1) && !lane0_needed_rs_full &&
-                       !jalr_stall_active && !mispredict && !lane0_vmv_stall && fetch_valid;
+                       !jalr_stall_active && !mispredict && !lane0_vmv_stall && fetch_valid && !icache_stall;
 
     wire lane0_breaks_flow = d0_is_jal || d0_is_jalr || (d0_is_branch && bht_predict_taken);
     wire lane1_dispatchable = d1_is_alu || d1_is_mul || d1_is_div || d1_is_load || d1_is_store;
@@ -1503,32 +1903,78 @@ module riscv64_ooo_proc #(
     wire lane1_fire = ENABLE_DUAL_ISSUE && lane0_fire && !lane0_breaks_flow && lane1_dispatchable &&
                        (rob_free_count >= 2) && lane1_resource_ok;
 
+    // Phase 16: lane 2 (youngest of 3-wide dispatch). Never branch-class
+    // (same scoping decision as lane 1 -- see module header), so no
+    // "breaks flow" check of its own is needed: lane 1 firing at all
+    // already implies !lane0_breaks_flow, and lane 2 can't break flow
+    // itself by construction, so straight-line fetch (pc+8) stays valid
+    // whenever lane 1 fires.
+    //
+    // Resource checks: alu_rs.v/mul_rs.v/lsq.v's has_3_free output is
+    // already, by construction, "given lane 0's and lane 1's *actual*
+    // alloc requests this cycle (each bank's alloc_req/alloc2_req are
+    // wired straight off laneN_fire && dN_is_<bank>), is there room for a
+    // 3rd" -- its own free-slot search only excludes free_idx if alloc_req
+    // genuinely fires and only excludes free_idx2 if alloc2_req genuinely
+    // fires, so has_3_free is *already* the exactly-right answer for
+    // "can lane 2 get a slot" regardless of whether lane 0 and/or lane 1
+    // also want this bank this cycle -- unlike lane 1's own check above
+    // (which only ever has one earlier lane to account for, so
+    // has_2_free-vs-!full genuinely is a two-way choice), gating lane 2's
+    // has_3_free use behind "did both d0 and d1 want this bank" is not
+    // just redundant but actively wrong: when *only* d1 (not d0) wants the
+    // bank, has_2_free's own exclusion is keyed off alloc_req (lane 0)
+    // alone, so with alloc_req=0 it silently degenerates to "any 1 free
+    // slot" instead of correctly demanding a 2nd slot beyond the one
+    // alloc2_req is about to consume -- lane 2's ROB/RAT entries would
+    // then be created while alu_rs/mul_rs/lsq itself, applying its own
+    // real do_alloc3 = alloc3_req && have_free3 check, finds no room and
+    // silently drops the allocation: a permanent deadlock on whatever tag
+    // nothing was ever going to broadcast (found by tracing an SMT test's
+    // ROB head stuck forever -- see the has_free2/have_free3 comments in
+    // alu_rs.v this mirrors). has_3_free alone already covers every case.
+    wire lane2_dispatchable = d2_is_alu || d2_is_mul || d2_is_div || d2_is_load || d2_is_store;
+
+    wire lane2_alu_ok = !d2_is_alu || alu_rs_has_3_free;
+    wire lane2_mul_ok = !d2_is_mul || mul_rs_has_3_free;
+    wire lane2_div_ok = !d2_is_div || (!d0_is_div && !d1_is_div && !div_rs_full);
+    wire lane2_lsq_ok = !(d2_is_load || d2_is_store) || lsq_has_3_free;
+    wire lane2_resource_ok = lane2_alu_ok && lane2_mul_ok && lane2_div_ok && lane2_lsq_ok;
+
+    wire lane2_fire = ENABLE_TRIPLE_ISSUE && lane1_fire && lane2_dispatchable &&
+                       (rob_free_count >= 3) && lane2_resource_ok;
+
     // Phase 7 fix: the same-cycle CDB bypass must also check that the
     // broadcast's tid matches the active thread -- rs1_tag/rs2_tag are
     // this thread's own ROB tag, only unique *within* its own ROB, so a
-    // tag-only compare against cdbA/cdbB (which can carry either
+    // tag-only compare against cdbA/cdbB/cdbC (which can carry any
     // thread's winner) can spuriously bypass-match a same-numbered tag
     // belonging to the OTHER thread's unrelated producer. See alu_rs.v's
     // identical fix for the shared-bank version of this same bug.
     wire cdbA_hits_active = cdbA_valid && (cdbA_tid == active_thread);
     wire cdbB_hits_active = cdbB_valid && (cdbB_tid == active_thread);
+    wire cdbC_hits_active = cdbC_valid && (cdbC_tid == active_thread);
 
     wire lane0_src1_ready = d0_src1_is_zero || d0_src1_is_pc || !rs1_busy ||
-                             (cdbA_hits_active && cdbA_tag == rs1_tag) || (cdbB_hits_active && cdbB_tag == rs1_tag) || rob_rs1_done;
+                             (cdbA_hits_active && cdbA_tag == rs1_tag) || (cdbB_hits_active && cdbB_tag == rs1_tag) ||
+                             (cdbC_hits_active && cdbC_tag == rs1_tag) || rob_rs1_done;
     wire [63:0] lane0_src1_val = d0_src1_is_zero ? 64'b0 :
                                   d0_src1_is_pc   ? pc :
                                   !rs1_busy       ? rf_read1 :
                                   (cdbA_hits_active && cdbA_tag == rs1_tag) ? cdbA_value :
                                   (cdbB_hits_active && cdbB_tag == rs1_tag) ? cdbB_value :
+                                  (cdbC_hits_active && cdbC_tag == rs1_tag) ? cdbC_value :
                                   rob_rs1_done    ? rob_rs1_value :
                                   64'b0;
 
     wire lane0_src2_ready = d0_src2_is_imm || !rs2_busy ||
-                             (cdbA_hits_active && cdbA_tag == rs2_tag) || (cdbB_hits_active && cdbB_tag == rs2_tag) || rob_rs2_done;
+                             (cdbA_hits_active && cdbA_tag == rs2_tag) || (cdbB_hits_active && cdbB_tag == rs2_tag) ||
+                             (cdbC_hits_active && cdbC_tag == rs2_tag) || rob_rs2_done;
     wire [63:0] lane0_src2_val = d0_src2_is_imm ? d0_imm :
                                   !rs2_busy      ? rf_read2 :
                                   (cdbA_hits_active && cdbA_tag == rs2_tag) ? cdbA_value :
                                   (cdbB_hits_active && cdbB_tag == rs2_tag) ? cdbB_value :
+                                  (cdbC_hits_active && cdbC_tag == rs2_tag) ? cdbC_value :
                                   rob_rs2_done   ? rob_rs2_value :
                                   64'b0;
 
@@ -1536,10 +1982,12 @@ module riscv64_ooo_proc #(
     wire lane1_rs2_intra_hit = d0_reg_write && (d1_rs2 == d0_rd) && (d0_rd != 5'd0);
 
     wire lane1_raw_src1_ready = !rs1b_busy_raw ||
-                                 (cdbA_hits_active && cdbA_tag == rs1b_tag_raw) || (cdbB_hits_active && cdbB_tag == rs1b_tag_raw) || rob_rs1b_done;
+                                 (cdbA_hits_active && cdbA_tag == rs1b_tag_raw) || (cdbB_hits_active && cdbB_tag == rs1b_tag_raw) ||
+                                 (cdbC_hits_active && cdbC_tag == rs1b_tag_raw) || rob_rs1b_done;
     wire [63:0] lane1_raw_src1_val = !rs1b_busy_raw ? rf1_read1 :
                                       (cdbA_hits_active && cdbA_tag == rs1b_tag_raw) ? cdbA_value :
                                       (cdbB_hits_active && cdbB_tag == rs1b_tag_raw) ? cdbB_value :
+                                      (cdbC_hits_active && cdbC_tag == rs1b_tag_raw) ? cdbC_value :
                                       rob_rs1b_done  ? rob_rs1b_value :
                                       64'b0;
 
@@ -1552,10 +2000,12 @@ module riscv64_ooo_proc #(
     wire [TB-1:0] lane1_src1_tag = lane1_rs1_intra_hit ? rob_alloc_tag : rs1b_tag_raw;
 
     wire lane1_raw_src2_ready = !rs2b_busy_raw ||
-                                 (cdbA_hits_active && cdbA_tag == rs2b_tag_raw) || (cdbB_hits_active && cdbB_tag == rs2b_tag_raw) || rob_rs2b_done;
+                                 (cdbA_hits_active && cdbA_tag == rs2b_tag_raw) || (cdbB_hits_active && cdbB_tag == rs2b_tag_raw) ||
+                                 (cdbC_hits_active && cdbC_tag == rs2b_tag_raw) || rob_rs2b_done;
     wire [63:0] lane1_raw_src2_val = !rs2b_busy_raw ? rf1_read2 :
                                       (cdbA_hits_active && cdbA_tag == rs2b_tag_raw) ? cdbA_value :
                                       (cdbB_hits_active && cdbB_tag == rs2b_tag_raw) ? cdbB_value :
+                                      (cdbC_hits_active && cdbC_tag == rs2b_tag_raw) ? cdbC_value :
                                       rob_rs2b_done  ? rob_rs2b_value :
                                       64'b0;
 
@@ -1565,24 +2015,80 @@ module riscv64_ooo_proc #(
                                   lane1_raw_src2_val;
     wire [TB-1:0] lane1_src2_tag = lane1_rs2_intra_hit ? rob_alloc_tag : rs2b_tag_raw;
 
+    // Phase 16: lane 2's operand readiness, same shape as lane 1's above
+    // but checked against *both* lane 0 and lane 1's own destinations --
+    // if both write the register lane 2 reads, lane 1's rename wins (it's
+    // the younger of the two, exactly the same last-writer-wins reasoning
+    // rat.v's write_en-then-write2_en-then-write3_en ordering already
+    // encodes for the RAT's own eventual committed state).
+    wire lane2_rs1_intra_hit_l0 = d0_reg_write && (d2_rs1 == d0_rd) && (d0_rd != 5'd0);
+    wire lane2_rs1_intra_hit_l1 = d1_reg_write && (d2_rs1 == d1_rd) && (d1_rd != 5'd0);
+    wire lane2_rs2_intra_hit_l0 = d0_reg_write && (d2_rs2 == d0_rd) && (d0_rd != 5'd0);
+    wire lane2_rs2_intra_hit_l1 = d1_reg_write && (d2_rs2 == d1_rd) && (d1_rd != 5'd0);
+
+    wire lane2_raw_src1_ready = !rs1c_busy_raw ||
+                                 (cdbA_hits_active && cdbA_tag == rs1c_tag_raw) || (cdbB_hits_active && cdbB_tag == rs1c_tag_raw) ||
+                                 (cdbC_hits_active && cdbC_tag == rs1c_tag_raw) || rob_rs1c_done;
+    wire [63:0] lane2_raw_src1_val = !rs1c_busy_raw ? rf2_read1 :
+                                      (cdbA_hits_active && cdbA_tag == rs1c_tag_raw) ? cdbA_value :
+                                      (cdbB_hits_active && cdbB_tag == rs1c_tag_raw) ? cdbB_value :
+                                      (cdbC_hits_active && cdbC_tag == rs1c_tag_raw) ? cdbC_value :
+                                      rob_rs1c_done  ? rob_rs1c_value :
+                                      64'b0;
+
+    wire lane2_src1_ready = d2_src1_is_zero || d2_src1_is_pc ||
+                             ((lane2_rs1_intra_hit_l0 || lane2_rs1_intra_hit_l1) ? 1'b0 : lane2_raw_src1_ready);
+    wire [63:0] lane2_src1_val = d2_src1_is_zero ? 64'b0 :
+                                  d2_src1_is_pc   ? pc2 :
+                                  (lane2_rs1_intra_hit_l0 || lane2_rs1_intra_hit_l1) ? 64'b0 :
+                                  lane2_raw_src1_val;
+    wire [TB-1:0] lane2_src1_tag = lane2_rs1_intra_hit_l1 ? rob_alloc2_tag :
+                                    lane2_rs1_intra_hit_l0 ? rob_alloc_tag :
+                                    rs1c_tag_raw;
+
+    wire lane2_raw_src2_ready = !rs2c_busy_raw ||
+                                 (cdbA_hits_active && cdbA_tag == rs2c_tag_raw) || (cdbB_hits_active && cdbB_tag == rs2c_tag_raw) ||
+                                 (cdbC_hits_active && cdbC_tag == rs2c_tag_raw) || rob_rs2c_done;
+    wire [63:0] lane2_raw_src2_val = !rs2c_busy_raw ? rf2_read2 :
+                                      (cdbA_hits_active && cdbA_tag == rs2c_tag_raw) ? cdbA_value :
+                                      (cdbB_hits_active && cdbB_tag == rs2c_tag_raw) ? cdbB_value :
+                                      (cdbC_hits_active && cdbC_tag == rs2c_tag_raw) ? cdbC_value :
+                                      rob_rs2c_done  ? rob_rs2c_value :
+                                      64'b0;
+
+    wire lane2_src2_ready = d2_src2_is_imm || ((lane2_rs2_intra_hit_l0 || lane2_rs2_intra_hit_l1) ? 1'b0 : lane2_raw_src2_ready);
+    wire [63:0] lane2_src2_val = d2_src2_is_imm ? d2_imm :
+                                  (lane2_rs2_intra_hit_l0 || lane2_rs2_intra_hit_l1) ? 64'b0 :
+                                  lane2_raw_src2_val;
+    wire [TB-1:0] lane2_src2_tag = lane2_rs2_intra_hit_l1 ? rob_alloc2_tag :
+                                    lane2_rs2_intra_hit_l0 ? rob_alloc_tag :
+                                    rs2c_tag_raw;
+
     wire rob_alloc_req  = lane0_fire;
     wire rob_alloc2_req = lane1_fire;
+    wire rob_alloc3_req = lane2_fire;
     wire rat_write_en   = lane0_fire && d0_reg_write;
     wire [TB-1:0] rat_new_tag = rob_alloc_tag;
     wire rat_write2_en  = lane1_fire && d1_reg_write;
     wire [TB-1:0] rat_new_tag2 = rob_alloc2_tag;
+    wire rat_write3_en  = lane2_fire && d2_reg_write;
+    wire [TB-1:0] rat_new_tag3 = rob_alloc3_tag;
 
     // ---- Demux: shared dispatch decisions -> the active thread's own ----
     // ---- RAT/ROB/branch_rs write ports -----------------------------------
     assign t0_rob_alloc_req  = (active_thread == 1'b0) && rob_alloc_req;
     assign t0_rob_alloc2_req = (active_thread == 1'b0) && rob_alloc2_req;
+    assign t0_rob_alloc3_req = (active_thread == 1'b0) && rob_alloc3_req;
     assign t1_rob_alloc_req  = (active_thread == 1'b1) && rob_alloc_req;
     assign t1_rob_alloc2_req = (active_thread == 1'b1) && rob_alloc2_req;
+    assign t1_rob_alloc3_req = (active_thread == 1'b1) && rob_alloc3_req;
 
     assign t0_rat_write_en  = (active_thread == 1'b0) && rat_write_en;
     assign t0_rat_write2_en = (active_thread == 1'b0) && rat_write2_en;
+    assign t0_rat_write3_en = (active_thread == 1'b0) && rat_write3_en;
     assign t1_rat_write_en  = (active_thread == 1'b1) && rat_write_en;
     assign t1_rat_write2_en = (active_thread == 1'b1) && rat_write2_en;
+    assign t1_rat_write3_en = (active_thread == 1'b1) && rat_write3_en;
 
     // ---- Per-thread PC: async misprediction/JALR redirect regardless of --
     // ---- whose dispatch turn it is; straight-line advance / JAL / -------
@@ -1607,8 +2113,14 @@ module riscv64_ooo_proc #(
         // active_thread==0 && lane0_fire (see its own definition above).
         else if (t0_ras_pop_req)
             t0_next_pc = t0_ras_top_addr;
+        // Phase 17: a BTB-predicted non-return JALR, same shape --
+        // t0_btb_predict_req likewise already implies active_thread==0 &&
+        // lane0_fire.
+        else if (t0_btb_predict_req)
+            t0_next_pc = btb_predict_target;
         else if (active_thread == 1'b0 && lane0_fire)
-            t0_next_pc = lane1_fire ? (t0_pc_latched + 64'd8) : (t0_pc_latched + 64'd4);
+            t0_next_pc = lane2_fire ? (t0_pc_latched + 64'd12) :
+                         lane1_fire ? (t0_pc_latched + 64'd8) : (t0_pc_latched + 64'd4);
         else
             t0_next_pc = t0_pc;
     end
@@ -1623,8 +2135,11 @@ module riscv64_ooo_proc #(
             t1_next_pc = t1_pc_latched + d0_imm;
         else if (t1_ras_pop_req)
             t1_next_pc = t1_ras_top_addr;
+        else if (t1_btb_predict_req)
+            t1_next_pc = btb_predict_target;
         else if (active_thread == 1'b1 && lane0_fire)
-            t1_next_pc = lane1_fire ? (t1_pc_latched + 64'd8) : (t1_pc_latched + 64'd4);
+            t1_next_pc = lane2_fire ? (t1_pc_latched + 64'd12) :
+                         lane1_fire ? (t1_pc_latched + 64'd8) : (t1_pc_latched + 64'd4);
         else
             t1_next_pc = t1_pc;
     end
@@ -1652,7 +2167,53 @@ module riscv64_ooo_proc #(
     assign t0_rat_commit_rd2        = t0_rob_head2_rd;
     assign t0_rat_commit_tag2       = t0_rob_head2_tag;
 
-    assign ecall_halt0 = t0_rob_commit_req && t0_rob_head_is_ecall;
+    wire t0_commit_rf_write_en3   = t0_rob_commit_req3 && t0_rob_head3_has_dest && (t0_rob_head3_rd != 5'd0);
+    wire [4:0] t0_commit_rf_write_reg3  = t0_rob_head3_rd;
+    wire [63:0] t0_commit_rf_write_data3 = t0_rob_head3_value;
+    assign t0_rat_commit_clear_en3  = t0_rob_commit_req3 && t0_rob_head3_has_dest;
+    assign t0_rat_commit_rd3        = t0_rob_head3_rd;
+    assign t0_rat_commit_tag3       = t0_rob_head3_tag;
+
+    // Phase 16: with 3-wide commit, the epilogue's ECALL (the program's
+    // last instruction) can retire as head2 or head3 in the same cycle as
+    // older instructions ahead of it -- not just as head alone, which was
+    // Phase 5's original, narrower assumption (still fine at 2-wide only
+    // by a timing coincidence that 3-wide commit makes common enough to
+    // hang every test: ECALL has no operands to wait on, so it reaches
+    // commit-eligible almost immediately, but nothing previously forced it
+    // to always be *this thread's own ROB head* at the exact cycle it's
+    // ready). Checking all three positions is what actually keeps this
+    // correct regardless of which position ECALL lands in.
+    //
+    // Root-caused (not just patched) during Phase 16 debugging: this OR
+    // expression, like commit_req/commit_req2/commit_req3 themselves, is
+    // a *predictive* combinational signal -- it reads true using this
+    // cycle's *pre-edge* register state, meaning "the upcoming edge is
+    // about to retire ECALL," not "ECALL has already retired." Any
+    // co-committing older sibling's own register-file write becomes
+    // architecturally visible on that SAME upcoming edge, together with
+    // ECALL's own retirement -- so a caller that samples architectural
+    // state the instant it observes the raw combinational signal is
+    // reading one edge too early for whatever happens to share ECALL's
+    // own retiring edge (invisible for ordinary tests, where every other
+    // write already landed many edges earlier, but real for the rare
+    // case where an older sibling's own commit lands on the exact same
+    // cycle as ECALL's). Registering it here -- turning "about to retire"
+    // into "has retired, state is now final" -- is the correct, minimal
+    // fix, not a timing band-aid: it changes when an external observer is
+    // told the halt condition is true, not any internal dispatch/execute/
+    // commit behavior, so it cannot let any additional instruction
+    // architecturally commit that wasn't already going to on this exact
+    // edge.
+    reg t0_ecall_halt0_r;
+    wire t0_ecall_halt0_comb = (t0_rob_commit_req  && t0_rob_head_is_ecall) ||
+                                (t0_rob_commit_req2 && t0_rob_head2_is_ecall) ||
+                                (t0_rob_commit_req3 && t0_rob_head3_is_ecall);
+    always @(posedge clk or posedge reset) begin
+        if (reset) t0_ecall_halt0_r <= 1'b0;
+        else t0_ecall_halt0_r <= t0_ecall_halt0_comb;
+    end
+    assign ecall_halt0 = t0_ecall_halt0_r;
 
     wire t1_commit_rf_write_en   = t1_rob_commit_req && t1_rob_head_has_dest && (t1_rob_head_rd != 5'd0);
     wire [4:0] t1_commit_rf_write_reg  = t1_rob_head_rd;
@@ -1668,7 +2229,26 @@ module riscv64_ooo_proc #(
     assign t1_rat_commit_rd2        = t1_rob_head2_rd;
     assign t1_rat_commit_tag2       = t1_rob_head2_tag;
 
+    wire t1_commit_rf_write_en3   = t1_rob_commit_req3 && t1_rob_head3_has_dest && (t1_rob_head3_rd != 5'd0);
+    wire [4:0] t1_commit_rf_write_reg3  = t1_rob_head3_rd;
+    wire [63:0] t1_commit_rf_write_data3 = t1_rob_head3_value;
+    assign t1_rat_commit_clear_en3  = t1_rob_commit_req3 && t1_rob_head3_has_dest;
+    assign t1_rat_commit_rd3        = t1_rob_head3_rd;
+    assign t1_rat_commit_tag3       = t1_rob_head3_tag;
+
     // ECALL halt is checked against the head only, per thread -- see
     // Phase 5's identical single-thread rationale.
-    assign ecall_halt1 = t1_rob_commit_req && t1_rob_head_is_ecall;
+    // Phase 16: see t0's identical fix (and its full root-cause writeup)
+    // above -- registered here for the same reason: turning a predictive
+    // "about to retire" combinational signal into a confirmed "has
+    // retired, state is final" one for any external observer.
+    reg t1_ecall_halt1_r;
+    wire t1_ecall_halt1_comb = (t1_rob_commit_req  && t1_rob_head_is_ecall) ||
+                                (t1_rob_commit_req2 && t1_rob_head2_is_ecall) ||
+                                (t1_rob_commit_req3 && t1_rob_head3_is_ecall);
+    always @(posedge clk or posedge reset) begin
+        if (reset) t1_ecall_halt1_r <= 1'b0;
+        else t1_ecall_halt1_r <= t1_ecall_halt1_comb;
+    end
+    assign ecall_halt1 = t1_ecall_halt1_r;
 endmodule

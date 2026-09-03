@@ -33,6 +33,11 @@ module dual_core_riscv64_ooo #(
     parameter L1_LINE_BYTES = 32,
     parameter SBUF_DEPTH = 4,
     parameter L2_LINES = 64,
+    // Phase 17: see icache.v's own header -- forwarded for tunability,
+    // same convention as L1_LINES/L1_LINE_BYTES above.
+    parameter ICACHE_LINES = 16,
+    parameter ICACHE_LINE_BYTES = 32,
+    parameter ICACHE_MISS_LATENCY = 4,
     // Phase 12 (FPGA bring-up): 0 (default, every existing testbench)
     // keeps every instruction/backing memory on its $readmemh path; 1
     // selects the AXI-writable variants everywhere -- see
@@ -70,7 +75,8 @@ module dual_core_riscv64_ooo #(
         .ROB_DEPTH(ROB_DEPTH), .ALU_RS_DEPTH(ALU_RS_DEPTH), .MUL_RS_DEPTH(MUL_RS_DEPTH),
         .LSQ_DEPTH(LSQ_DEPTH), .ENABLE_DUAL_ISSUE(ENABLE_DUAL_ISSUE), .LANES(LANES),
         .VEC_RS_DEPTH(VEC_RS_DEPTH), .L1_LINES(L1_LINES), .L1_LINE_BYTES(L1_LINE_BYTES),
-        .SBUF_DEPTH(SBUF_DEPTH), .USE_AXI_MEM(USE_AXI_MEM)
+        .SBUF_DEPTH(SBUF_DEPTH), .USE_AXI_MEM(USE_AXI_MEM),
+        .ICACHE_LINES(ICACHE_LINES), .ICACHE_LINE_BYTES(ICACHE_LINE_BYTES), .ICACHE_MISS_LATENCY(ICACHE_MISS_LATENCY)
     ) core0 (
         .clk(clk), .reset(reset),
         .pc_out0(c0t0_pc_out), .pc_out1(c0t1_pc_out),
@@ -97,7 +103,8 @@ module dual_core_riscv64_ooo #(
         .ROB_DEPTH(ROB_DEPTH), .ALU_RS_DEPTH(ALU_RS_DEPTH), .MUL_RS_DEPTH(MUL_RS_DEPTH),
         .LSQ_DEPTH(LSQ_DEPTH), .ENABLE_DUAL_ISSUE(ENABLE_DUAL_ISSUE), .LANES(LANES),
         .VEC_RS_DEPTH(VEC_RS_DEPTH), .L1_LINES(L1_LINES), .L1_LINE_BYTES(L1_LINE_BYTES),
-        .SBUF_DEPTH(SBUF_DEPTH), .USE_AXI_MEM(USE_AXI_MEM)
+        .SBUF_DEPTH(SBUF_DEPTH), .USE_AXI_MEM(USE_AXI_MEM),
+        .ICACHE_LINES(ICACHE_LINES), .ICACHE_LINE_BYTES(ICACHE_LINE_BYTES), .ICACHE_MISS_LATENCY(ICACHE_MISS_LATENCY)
     ) core1 (
         .clk(clk), .reset(reset),
         .pc_out0(c1t0_pc_out), .pc_out1(c1t1_pc_out),

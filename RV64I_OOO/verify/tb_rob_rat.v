@@ -37,8 +37,12 @@ module tb_rob_rat;
         .alloc2_req(1'b0), .alloc2_has_dest(1'b0), .alloc2_rd(5'b0),
         .alloc2_is_store(1'b0), .alloc2_is_ecall(1'b0), .alloc2_is_vec_dest(1'b0),
         .alloc2_tag(), .free_count(),
+        .alloc3_req(1'b0), .alloc3_has_dest(1'b0), .alloc3_rd(5'b0),
+        .alloc3_is_store(1'b0), .alloc3_is_ecall(1'b0), .alloc3_is_vec_dest(1'b0),
+        .alloc3_tag(),
         .mark_valid(mark_valid), .mark_tag(mark_tag), .mark_value(mark_value),
         .mark_b_valid(1'b0), .mark_b_tag({TB{1'b0}}), .mark_b_value(64'b0),
+        .mark_c_valid(1'b0), .mark_c_tag({TB{1'b0}}), .mark_c_value(64'b0),
         .vec_mark_valid(1'b0), .vec_mark_tag({TB{1'b0}}), .vec_mark_value(128'b0),
         .mark2_valid(1'b0), .mark2_tag({TB{1'b0}}),
         .extra_mark_valid(4'b0), .extra_mark_tag_flat(12'b0),
@@ -47,6 +51,8 @@ module tb_rob_rat;
         .lookup2_tag({TB{1'b0}}), .lookup2_done(), .lookup2_value(),
         .lookup3_tag({TB{1'b0}}), .lookup3_done(), .lookup3_value(),
         .lookup4_tag({TB{1'b0}}), .lookup4_done(), .lookup4_value(),
+        .lookup5_tag({TB{1'b0}}), .lookup5_done(), .lookup5_value(),
+        .lookup6_tag({TB{1'b0}}), .lookup6_done(), .lookup6_value(),
         .vec_lookup1_tag({TB{1'b0}}), .vec_lookup1_done(), .vec_lookup1_value(),
         .vec_lookup2_tag({TB{1'b0}}), .vec_lookup2_done(), .vec_lookup2_value(),
         .head_ready(head_ready), .head_tag(head_tag), .head_has_dest(head_has_dest),
@@ -56,7 +62,10 @@ module tb_rob_rat;
         .commit_req(commit_req),
         .head2_ready(), .head2_tag(), .head2_has_dest(), .head2_rd(), .head2_value(),
         .head2_vec_value(), .head2_is_vec_dest(),
-        .head2_is_store(), .head2_is_ecall(), .commit_req2(1'b0)
+        .head2_is_store(), .head2_is_ecall(), .commit_req2(1'b0),
+        .head3_ready(), .head3_tag(), .head3_has_dest(), .head3_rd(), .head3_value(),
+        .head3_vec_value(), .head3_is_vec_dest(),
+        .head3_is_store(), .head3_is_ecall(), .commit_req3(1'b0)
     );
 
     // ---- RAT ----
@@ -77,10 +86,14 @@ module tb_rob_rat;
         .rs2_busy(rs2_busy), .rs2_tag(rs2_tag),
         .rs1b(5'b0), .rs2b(5'b0),
         .rs1b_busy(), .rs1b_tag(), .rs2b_busy(), .rs2b_tag(),
+        .rs1c(5'b0), .rs2c(5'b0),
+        .rs1c_busy(), .rs1c_tag(), .rs2c_busy(), .rs2c_tag(),
         .write_en(write_en), .rd(wr_rd), .new_tag(wr_tag),
         .write2_en(1'b0), .rd2(5'b0), .new_tag2({TB{1'b0}}),
+        .write3_en(1'b0), .rd3(5'b0), .new_tag3({TB{1'b0}}),
         .commit_clear_en(commit_clear_en), .commit_rd(commit_rd), .commit_tag(commit_tag),
         .commit_clear_en2(1'b0), .commit_rd2(5'b0), .commit_tag2({TB{1'b0}}),
+        .commit_clear_en3(1'b0), .commit_rd3(5'b0), .commit_tag3({TB{1'b0}}),
         .checkpoint_save(1'b0), .checkpoint_restore(1'b0)
     );
 
