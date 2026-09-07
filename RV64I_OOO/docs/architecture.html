@@ -1,0 +1,523 @@
+<title>RV64I_OOO Architecture</title>
+<meta name="description" content="System and pipeline diagrams for the RV64I+M out-of-order core: the dual-core coherent memory system and the 3-wide superscalar execution pipeline.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#eef2f6;
+    --surface:#ffffff;
+    --surface-2:#e3eaf1;
+    --surface-3:#d7e0e9;
+    --line:#b9c6d2;
+    --line-strong:#8fa2b3;
+    --text:#152332;
+    --text-dim:#5c6d7d;
+    --accent:#b5651d;
+    --accent-soft:#e7c9a8;
+    --accent2:#1c7d7d;
+    --accent2-soft:#bfe3e0;
+    --mono:'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Consolas, monospace;
+    --sans:'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0f1620;
+      --surface:#151f2b;
+      --surface-2:#1b2836;
+      --surface-3:#223142;
+      --line:#31465c;
+      --line-strong:#4a6178;
+      --text:#dfe8f0;
+      --text-dim:#8ba0b3;
+      --accent:#e0a458;
+      --accent-soft:#4a3a24;
+      --accent2:#5cc7c2;
+      --accent2-soft:#183836;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0f1620;
+    --surface:#151f2b;
+    --surface-2:#1b2836;
+    --surface-3:#223142;
+    --line:#31465c;
+    --line-strong:#4a6178;
+    --text:#dfe8f0;
+    --text-dim:#8ba0b3;
+    --accent:#e0a458;
+    --accent-soft:#4a3a24;
+    --accent2:#5cc7c2;
+    --accent2-soft:#183836;
+  }
+
+  *{box-sizing:border-box;}
+  body{
+    background:var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    line-height:1.55;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:56px 28px 90px;}
+
+  header.masthead{
+    display:flex; justify-content:space-between; align-items:flex-end;
+    gap:24px; border-bottom:1px solid var(--line); padding-bottom:22px; margin-bottom:8px;
+    flex-wrap:wrap;
+  }
+  .kicker{
+    font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent); margin:0 0 10px;
+  }
+  h1{
+    font-family:var(--mono); font-weight:600; font-size:clamp(28px,4vw,40px);
+    margin:0; letter-spacing:-0.01em; text-wrap:balance;
+  }
+  .subtitle{
+    max-width:60ch; color:var(--text-dim); font-size:15px; margin-top:10px;
+  }
+  .status-strip{
+    font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:right;
+    line-height:1.9; white-space:nowrap;
+  }
+  .status-strip b{color:var(--text); font-weight:600;}
+
+  .params{
+    display:grid; grid-template-columns:repeat(6,1fr); gap:1px;
+    background:var(--line); border:1px solid var(--line); border-radius:8px;
+    overflow:hidden; margin:30px 0 54px;
+  }
+  .param{background:var(--surface); padding:14px 10px; text-align:center;}
+  .param .v{font-family:var(--mono); font-size:20px; font-weight:600; font-variant-numeric:tabular-nums;}
+  .param .k{font-size:10.5px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.06em; margin-top:4px;}
+
+  section.figure{margin:64px 0;}
+  .figure-head{display:flex; align-items:baseline; gap:14px; margin-bottom:4px; flex-wrap:wrap;}
+  .fig-no{font-family:var(--mono); color:var(--accent); font-size:13px; font-weight:600;}
+  h2{font-family:var(--mono); font-size:20px; margin:0; font-weight:600;}
+  .fig-desc{color:var(--text-dim); font-size:14.5px; max-width:76ch; margin:8px 0 22px;}
+
+  .panel{
+    background:
+      linear-gradient(var(--surface),var(--surface)) padding-box,
+      repeating-linear-gradient(0deg, transparent, transparent 27px, var(--surface-2) 27px, var(--surface-2) 28px) border-box;
+    background-color:var(--surface);
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size:28px 28px;
+    background-position:-1px -1px;
+    border:1px solid var(--line-strong);
+    border-radius:10px;
+    padding:8px;
+    overflow-x:auto;
+  }
+  .panel svg{display:block; margin:0 auto; min-width:640px; max-width:100%; height:auto;}
+
+  figcaption.note{
+    font-size:13px; color:var(--text-dim); margin-top:14px; max-width:82ch;
+  }
+  figcaption.note code{font-family:var(--mono); font-size:12px; background:var(--surface-2); padding:1px 5px; border-radius:4px; color:var(--text);}
+
+  .legend{display:flex; gap:22px; flex-wrap:wrap; margin-top:16px; font-family:var(--mono); font-size:11px; color:var(--text-dim);}
+  .legend span{display:inline-flex; align-items:center; gap:7px;}
+  .swatch{width:16px; height:2.5px; display:inline-block;}
+
+  .two-col{display:grid; grid-template-columns:1.35fr .95fr; gap:36px; align-items:start;}
+  @media (max-width:900px){ .two-col{grid-template-columns:1fr;} }
+
+  .sidebox{
+    background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:18px 20px;
+    font-size:13.5px;
+  }
+  .sidebox h3{font-family:var(--mono); font-size:12px; text-transform:uppercase; letter-spacing:.06em; margin:0 0 10px; color:var(--text-dim);}
+  .sidebox ul{margin:0; padding-left:18px;}
+  .sidebox li{margin-bottom:7px;}
+  .sidebox li:last-child{margin-bottom:0;}
+  .sidebox code{font-family:var(--mono); font-size:12px; background:var(--surface-2); padding:0 4px; border-radius:3px;}
+
+  footer{
+    margin-top:70px; padding-top:20px; border-top:1px solid var(--line);
+    font-family:var(--mono); font-size:11px; color:var(--text-dim);
+    display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div>
+      <p class="kicker">Reference — RV64I_OOO</p>
+      <h1>Architecture &amp; Microarchitecture</h1>
+      <p class="subtitle">Tomasulo + reorder-buffer out-of-order RV64I+M core. Two diagrams: the system a core sits inside, and the pipeline inside a core.</p>
+    </div>
+    <div class="status-strip">
+      Phases 1–17 <b>complete</b><br>
+      3-wide dispatch / CDB / commit<br>
+      36/36 single-core, 3/3 coherency suites
+    </div>
+  </header>
+
+  <div class="params">
+    <div class="param"><div class="v">16</div><div class="k">ROB entries</div></div>
+    <div class="param"><div class="v">8</div><div class="k">ALU RS</div></div>
+    <div class="param"><div class="v">4</div><div class="k">Mul RS</div></div>
+    <div class="param"><div class="v">8</div><div class="k">LSQ</div></div>
+    <div class="param"><div class="v">3</div><div class="k">issue width</div></div>
+    <div class="param"><div class="v">2</div><div class="k">SMT threads</div></div>
+  </div>
+
+  <!-- ================= FIGURE 1 : SYSTEM ================= -->
+  <section class="figure">
+    <div class="figure-head">
+      <span class="fig-no">FIG. 1</span>
+      <h2>System architecture — coherent dual-core</h2>
+    </div>
+    <p class="fig-desc">
+      Two independent OoO cores (each 2-thread SMT) hold private write-back L1s; <code style="font-family:var(--mono)">l2_cache.v</code>
+      arbitrates a shared, inclusive L2 as a real MESI director across three coherent ports — core&nbsp;0, core&nbsp;1, and a reserved
+      GPU-class port that speaks the identical req/resp+snoop protocol but has no compute core wired to it yet. An AXI4-Lite peripheral
+      lets an external host load programs and start/stop the cores without re-synthesizing.
+    </p>
+
+    <div class="panel">
+      <svg viewBox="0 0 1180 560" role="img" aria-label="Two OoO cores with private MESI L1 caches share an L2 coherence director over three ports — core 0, core 1, and a reserved GPU-class port — backed by AXI-loadable memory, all wrapped by an FPGA IP block reachable through an AXI4-Lite control peripheral.">
+        <defs>
+          <marker id="a1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+          <marker id="a1acc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent2)"/>
+          </marker>
+        </defs>
+
+        <!-- fpga_top boundary -->
+        <rect x="30" y="30" width="1000" height="430" rx="10" fill="none" stroke="var(--line-strong)" stroke-width="1.5" stroke-dasharray="3 5"/>
+        <text x="48" y="54" font-family="var(--mono)" font-size="11" letter-spacing="1" fill="var(--text-dim)">FPGA_TOP — IP BLOCK (PYNQ-Z1 BRING-UP)</text>
+
+        <!-- Core 0 -->
+        <rect x="70" y="80" width="270" height="120" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="205" y="106" text-anchor="middle" font-family="var(--mono)" font-size="13" font-weight="600" fill="var(--text)">CORE 0</text>
+        <text x="205" y="124" text-anchor="middle" font-family="var(--mono)" font-size="10.5" fill="var(--text-dim)">3-wide OoO · SMT T0 / T1</text>
+        <rect x="95" y="140" width="90" height="42" rx="5" fill="var(--surface-3)" stroke="var(--line)"/>
+        <text x="140" y="165" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text)">thread 0</text>
+        <rect x="195" y="140" width="90" height="42" rx="5" fill="var(--surface-3)" stroke="var(--line)"/>
+        <text x="240" y="165" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text)">thread 1</text>
+
+        <!-- Core 1 -->
+        <rect x="380" y="80" width="270" height="120" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="515" y="106" text-anchor="middle" font-family="var(--mono)" font-size="13" font-weight="600" fill="var(--text)">CORE 1</text>
+        <text x="515" y="124" text-anchor="middle" font-family="var(--mono)" font-size="10.5" fill="var(--text-dim)">3-wide OoO · SMT T0 / T1</text>
+        <rect x="405" y="140" width="90" height="42" rx="5" fill="var(--surface-3)" stroke="var(--line)"/>
+        <text x="450" y="165" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text)">thread 0</text>
+        <rect x="505" y="140" width="90" height="42" rx="5" fill="var(--surface-3)" stroke="var(--line)"/>
+        <text x="550" y="165" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text)">thread 1</text>
+
+        <!-- L1s -->
+        <rect x="105" y="240" width="200" height="60" rx="7" fill="var(--surface)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="205" y="264" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--text)">L1 — private, MESI</text>
+        <text x="205" y="280" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">direct-mapped · write-back</text>
+
+        <rect x="415" y="240" width="200" height="60" rx="7" fill="var(--surface)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="515" y="264" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--text)">L1 — private, MESI</text>
+        <text x="515" y="280" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">direct-mapped · write-back</text>
+
+        <!-- GPU reserved port -->
+        <rect x="740" y="240" width="220" height="60" rx="7" fill="none" stroke="var(--line)" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <text x="850" y="264" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--text-dim)">reserved coherent port</text>
+        <text x="850" y="280" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">GPU-class agent · no core wired</text>
+
+        <!-- L2 director -->
+        <rect x="230" y="340" width="400" height="70" rx="8" fill="var(--surface-2)" stroke="var(--accent2)" stroke-width="2"/>
+        <text x="430" y="368" text-anchor="middle" font-family="var(--mono)" font-size="13" font-weight="600" fill="var(--text)">L2 — 3-agent MESI director</text>
+        <text x="430" y="386" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text-dim)">shared · inclusive · write-through · fixed priority core0 &gt; core1 &gt; gpu</text>
+
+        <!-- backing mem -->
+        <rect x="330" y="440" width="200" height="50" rx="7" fill="var(--surface)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="430" y="470" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--text)">AXI-loadable backing memory</text>
+
+        <!-- AXI ctrl peripheral, outside boundary -->
+        <rect x="720" y="360" width="230" height="60" rx="7" fill="var(--surface)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="835" y="384" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--text)">axi_ooo_ctrl</text>
+        <text x="835" y="400" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">AXI4-Lite control / status</text>
+
+        <rect x="1040" y="365" width="120" height="50" rx="7" fill="var(--surface-2)" stroke="var(--line)" stroke-width="1.5"/>
+        <text x="1100" y="395" text-anchor="middle" font-family="var(--mono)" font-size="10.5" fill="var(--text)">PS / host</text>
+
+        <!-- core -> L1 -->
+        <line x1="205" y1="200" x2="205" y2="238" stroke="currentColor" stroke-width="1.5" marker-end="url(#a1)"/>
+        <line x1="515" y1="200" x2="515" y2="238" stroke="currentColor" stroke-width="1.5" marker-end="url(#a1)"/>
+
+        <!-- L1 -> L2 (coherent, accent2) -->
+        <path d="M205,300 L205,325 L330,325 L330,338" fill="none" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a1acc)"/>
+        <path d="M515,300 L515,325 L530,325 L530,338" fill="none" stroke="var(--accent2)" stroke-width="2" marker-end="url(#a1acc)"/>
+        <text x="345" y="322" font-family="var(--mono)" font-size="9.5" fill="var(--accent2)">snoop / fill</text>
+
+        <!-- gpu port -> L2 (dashed accent2) -->
+        <path d="M850,300 L850,325 L630,325 L630,360" fill="none" stroke="var(--accent2)" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#a1acc)"/>
+
+        <!-- L2 -> mem -->
+        <line x1="430" y1="410" x2="430" y2="438" stroke="currentColor" stroke-width="1.5" marker-end="url(#a1)"/>
+
+        <!-- L2 -> axi ctrl visibility (dotted, same fabric) -->
+        <line x1="630" y1="390" x2="718" y2="390" stroke="var(--line-strong)" stroke-width="1.5" stroke-dasharray="2 4"/>
+
+        <!-- ctrl <-> ps -->
+        <line x1="950" y1="390" x2="1038" y2="390" stroke="currentColor" stroke-width="1.5" marker-start="url(#a1)" marker-end="url(#a1)"/>
+        <text x="994" y="382" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="var(--text-dim)">load / start / status</text>
+
+        <text x="530" y="520" text-anchor="middle" font-family="var(--sans)" font-size="11.5" fill="var(--text-dim)">Redundant configuration (lockstep DMR) replaces this whole diagram with the pair shown in Fig. 1a — no sharing, only comparison.</text>
+      </svg>
+    </div>
+
+    <div class="legend">
+      <span><span class="swatch" style="background:currentColor"></span>control / data</span>
+      <span><span class="swatch" style="background:var(--accent2)"></span>coherency fabric (MESI req/resp + snoop)</span>
+      <span><span class="swatch" style="background:var(--line-strong);border-top:1px dashed var(--line-strong);height:0"></span>reserved / unwired port</span>
+    </div>
+  </section>
+
+  <!-- ================= FIGURE 1a : LOCKSTEP INSET ================= -->
+  <section class="figure" style="margin-top:34px;">
+    <div class="figure-head">
+      <span class="fig-no">FIG. 1a</span>
+      <h2>Alternate configuration — lockstep DMR</h2>
+    </div>
+    <p class="fig-desc">
+      For redundancy instead of throughput, two full core copies run the identical program from identical initial state with
+      <strong>no coherence link between them at all</strong> — every signal that would join them in Fig. 1 is absent by construction.
+      A comparator watches both every cycle and latches a sticky fault flag on any divergence.
+    </p>
+    <div class="panel">
+      <svg viewBox="0 0 900 220" role="img" aria-label="Two identical core-and-L1 copies run the same program independently; a lockstep checker compares them every cycle and sets a sticky fault flag on divergence.">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+        <rect x="40" y="30" width="230" height="80" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="155" y="60" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="600" fill="var(--text)">CORE A + L1</text>
+        <text x="155" y="78" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text-dim)">program P, state S₀</text>
+
+        <rect x="630" y="30" width="230" height="80" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="745" y="60" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="600" fill="var(--text)">CORE B + L1</text>
+        <text x="745" y="78" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text-dim)">program P, state S₀</text>
+
+        <rect x="335" y="130" width="230" height="70" rx="8" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="450" y="158" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="600" fill="var(--text)">lockstep checker</text>
+        <text x="450" y="176" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--accent)">sticky fault flag</text>
+
+        <path d="M155,110 L155,165 L333,165" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#a2)"/>
+        <path d="M745,110 L745,165 L567,165" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#a2)"/>
+        <text x="150" y="140" font-family="var(--mono)" font-size="9" fill="var(--text-dim)">compare</text>
+        <text x="620" y="140" text-anchor="end" font-family="var(--mono)" font-size="9" fill="var(--text-dim)">compare</text>
+      </svg>
+    </div>
+  </section>
+
+  <!-- ================= FIGURE 2 : MICROARCHITECTURE ================= -->
+  <section class="figure">
+    <div class="figure-head">
+      <span class="fig-no">FIG. 2</span>
+      <h2>Core microarchitecture — 3-wide OoO pipeline</h2>
+    </div>
+    <p class="fig-desc">
+      One thread's slice through a single core. Fetch is speculative (icache + BTB + RAS + BHT); dispatch renames through the RAT
+      and allocates a ROB tag <em>and</em> a reservation-station entry in the same cycle; execution is free-running out of order;
+      three common data buses arbitrate oldest-ROB-tag-first and are the one resource every bank contends for; commit is strictly
+      in order and is the only place architectural state — register file, memory, RAT — is ever actually written.
+    </p>
+
+    <div class="panel">
+      <svg viewBox="0 0 1440 800" role="img" aria-label="Fetch through icache, BTB, RAS and BHT feeds decode, then rename/dispatch allocates ROB and reservation-station entries together. Five reservation-station banks execute independently and broadcast on a 3-wide, oldest-first common data bus into the reorder buffer, which commits up to three in order to the register file and store buffer, clearing RAT entries and, on a branch misprediction, redirecting fetch.">
+        <defs>
+          <marker id="b1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+          </marker>
+          <marker id="b1acc" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+
+        <!-- misprediction redirect, top -->
+        <path d="M300,74 C300,40 1030,40 1030,74" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#b1acc)"/>
+        <text x="665" y="34" text-anchor="middle" font-family="var(--mono)" font-size="10.5" fill="var(--accent)">misprediction → squash-by-tag (RS/LSQ/ROB) + RAT checkpoint restore + redirect PC</text>
+
+        <!-- ================= FETCH ================= -->
+        <rect x="20" y="90" width="220" height="560" rx="10" fill="none" stroke="var(--line)" stroke-width="1.2" stroke-dasharray="3 5"/>
+        <text x="130" y="112" text-anchor="middle" font-family="var(--mono)" font-size="10.5" letter-spacing="1" fill="var(--text-dim)">FETCH</text>
+
+        <rect x="40" y="130" width="180" height="50" rx="6" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="130" y="160" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--text)">next-PC mux</text>
+
+        <rect x="40" y="205" width="180" height="70" rx="6" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="130" y="232" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--text)">icache.v</text>
+        <text x="130" y="248" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">direct-mapped, ×3/cyc</text>
+        <text x="130" y="262" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">tunable miss latency</text>
+
+        <rect x="40" y="300" width="85" height="46" rx="6" fill="var(--surface)" stroke="var(--line)"/>
+        <text x="82" y="320" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text)">btb.v</text>
+        <text x="82" y="333" text-anchor="middle" font-family="var(--mono)" font-size="8" fill="var(--text-dim)">JALR target</text>
+
+        <rect x="135" y="300" width="85" height="46" rx="6" fill="var(--surface)" stroke="var(--line)"/>
+        <text x="177" y="320" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text)">ras.v</text>
+        <text x="177" y="333" text-anchor="middle" font-family="var(--mono)" font-size="8" fill="var(--text-dim)">call/return LIFO</text>
+
+        <rect x="40" y="358" width="180" height="44" rx="6" fill="var(--surface)" stroke="var(--line)"/>
+        <text x="130" y="378" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text)">bht.v</text>
+        <text x="130" y="392" text-anchor="middle" font-family="var(--mono)" font-size="8" fill="var(--text-dim)">2-bit saturating, taken/not</text>
+
+        <line x1="130" y1="180" x2="130" y2="203" stroke="currentColor" stroke-width="1.5" marker-end="url(#b1)"/>
+        <path d="M82,300 L82,285 L130,285 L130,182" fill="none" stroke="currentColor" stroke-width="1.2" marker-end="url(#b1)"/>
+        <path d="M177,300 L177,285 L130,285" fill="none" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M130,358 L130,345" fill="none" stroke="currentColor" stroke-width="1.2" marker-start="url(#b1)"/>
+
+        <!-- ================= DECODE ================= -->
+        <rect x="270" y="220" width="150" height="90" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="345" y="255" text-anchor="middle" font-family="var(--mono)" font-size="11.5" font-weight="600" fill="var(--text)">decode_ooo</text>
+        <text x="345" y="272" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">RV64I+M, ×3</text>
+        <text x="345" y="286" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">classify → RS bank</text>
+
+        <line x1="220" y1="245" x2="268" y2="245" stroke="currentColor" stroke-width="1.5" marker-end="url(#b1)"/>
+
+        <!-- ================= RENAME / DISPATCH ================= -->
+        <rect x="460" y="150" width="170" height="80" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="545" y="180" text-anchor="middle" font-family="var(--mono)" font-size="11.5" font-weight="600" fill="var(--text)">rat.v</text>
+        <text x="545" y="197" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">rename ×3</text>
+        <text x="545" y="211" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">checkpoint / restore</text>
+
+        <rect x="460" y="260" width="170" height="70" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="545" y="288" text-anchor="middle" font-family="var(--mono)" font-size="10.5" font-weight="600" fill="var(--text)">dispatch</text>
+        <text x="545" y="304" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">intra-group RAW/WAW fwd</text>
+        <text x="545" y="317" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">lane 2 vs lanes 0 &amp; 1</text>
+
+        <line x1="420" y1="260" x2="458" y2="260" stroke="currentColor" stroke-width="1.5" marker-end="url(#b1)"/>
+        <line x1="545" y1="230" x2="545" y2="258" stroke="currentColor" stroke-width="1.2"/>
+
+        <!-- alloc ROB tag, routed along top to ROB -->
+        <path d="M630,180 C 900,180 1000,180 1000,250" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#b1)"/>
+        <text x="820" y="172" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">alloc ROB tag ×3</text>
+
+        <!-- ================= ISSUE / RS BANKS ================= -->
+        <rect x="700" y="90" width="220" height="560" rx="10" fill="none" stroke="var(--line)" stroke-width="1.2" stroke-dasharray="3 5"/>
+        <text x="810" y="112" text-anchor="middle" font-family="var(--mono)" font-size="10.5" letter-spacing="1" fill="var(--text-dim)">ISSUE / EXECUTE</text>
+
+        <!-- ALU RS -->
+        <rect x="720" y="130" width="180" height="76" rx="7" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="810" y="155" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--text)">alu_rs · 8</text>
+        <text x="810" y="172" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">3 picks/cyc, oldest-first</text>
+        <text x="810" y="186" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">comb. 1-cycle ALU ×3</text>
+
+        <!-- Branch RS -->
+        <rect x="720" y="216" width="180" height="60" rx="7" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="810" y="240" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--text)">branch_rs · 1</text>
+        <text x="810" y="256" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">lane-0 only, resolves BHT/RAS/BTB</text>
+
+        <!-- Mul RS -->
+        <rect x="720" y="286" width="180" height="60" rx="7" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="810" y="308" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--text)">mul_rs · 4</text>
+        <text x="810" y="324" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">1-cycle multiplier</text>
+
+        <!-- Div RS -->
+        <rect x="720" y="356" width="180" height="60" rx="7" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="810" y="378" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--text)">div_rs · 1</text>
+        <text x="810" y="394" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">wraps div_fu, iterative ~64cyc</text>
+
+        <!-- LSQ -->
+        <rect x="720" y="426" width="180" height="76" rx="7" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="810" y="450" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--text)">lsq · 8</text>
+        <text x="810" y="467" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">age-ordered alias check</text>
+        <text x="810" y="481" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">→ store buffer → L1D</text>
+
+        <line x1="630" y1="295" x2="718" y2="220" stroke="currentColor" stroke-width="1.5" marker-end="url(#b1)"/>
+        <text x="655" y="255" font-family="var(--mono)" font-size="9" fill="var(--text-dim)">dispatch: alloc RS entry ×3</text>
+
+        <!-- ================= CDB BUS ================= -->
+        <line x1="960" y1="120" x2="960" y2="630" stroke="var(--accent)" stroke-width="3"/>
+        <text x="960" y="106" text-anchor="middle" font-family="var(--mono)" font-size="10.5" fill="var(--accent)">CDB ×3 — oldest-ROB-tag-first</text>
+        <circle cx="960" cy="168" r="4" fill="var(--accent)"/>
+        <circle cx="960" cy="246" r="4" fill="var(--accent)"/>
+        <circle cx="960" cy="316" r="4" fill="var(--accent)"/>
+        <circle cx="960" cy="386" r="4" fill="var(--accent)"/>
+        <circle cx="960" cy="464" r="4" fill="var(--accent)"/>
+        <line x1="900" y1="168" x2="958" y2="168" stroke="var(--accent)" stroke-width="1.5"/>
+        <line x1="900" y1="246" x2="958" y2="246" stroke="var(--accent)" stroke-width="1.5"/>
+        <line x1="900" y1="316" x2="958" y2="316" stroke="var(--accent)" stroke-width="1.5"/>
+        <line x1="900" y1="386" x2="958" y2="386" stroke="var(--accent)" stroke-width="1.5"/>
+        <line x1="900" y1="464" x2="958" y2="464" stroke="var(--accent)" stroke-width="1.5"/>
+        <text x="985" y="530" font-family="var(--mono)" font-size="9" fill="var(--text-dim)">branch + ready</text>
+        <text x="985" y="542" font-family="var(--mono)" font-size="9" fill="var(--text-dim)">stores mark ROB</text>
+        <text x="985" y="554" font-family="var(--mono)" font-size="9" fill="var(--text-dim)">directly (no bcast)</text>
+
+        <!-- ================= ROB ================= -->
+        <rect x="1020" y="120" width="150" height="510" rx="9" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="1095" y="146" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="600" fill="var(--text)">rob.v</text>
+        <text x="1095" y="163" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">16 entries</text>
+        <text x="1095" y="177" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">mark done ×3</text>
+        <text x="1095" y="191" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">in-order, precise state</text>
+
+        <line x1="960" y1="300" x2="1018" y2="300" stroke="var(--accent)" stroke-width="2" marker-end="url(#b1acc)"/>
+
+        <!-- ROB -> commit -->
+        <rect x="1220" y="150" width="190" height="70" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="1315" y="178" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--text)">register_file</text>
+        <text x="1315" y="194" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">3 write ports</text>
+        <text x="1315" y="207" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">written only at commit</text>
+
+        <rect x="1220" y="240" width="190" height="70" rx="8" fill="var(--surface-2)" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text x="1315" y="266" text-anchor="middle" font-family="var(--mono)" font-size="11" font-weight="600" fill="var(--text)">store buffer</text>
+        <text x="1315" y="282" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">4 entries → L1D</text>
+        <text x="1315" y="296" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">async drain</text>
+
+        <text x="1195" y="200" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">commit</text>
+        <text x="1195" y="212" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">×3, in order</text>
+        <line x1="1170" y1="185" x2="1218" y2="185" stroke="currentColor" stroke-width="1.5" marker-end="url(#b1)"/>
+        <line x1="1170" y1="255" x2="1218" y2="255" stroke="currentColor" stroke-width="1.5" marker-end="url(#b1)"/>
+
+        <!-- commit -> RAT clear -->
+        <path d="M1220,175 C 900,90 630,90 545,148" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2 3" marker-end="url(#b1)"/>
+        <text x="900" y="82" text-anchor="middle" font-family="var(--mono)" font-size="9.5" fill="var(--text-dim)">commit-clear RAT[rd] (only if still pointing at this tag)</text>
+
+        <!-- branch resolve -> redirect -->
+        <path d="M900,220 C 960,60 1000,60 1030,74" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3"/>
+
+        <!-- ecall commit barrier note -->
+        <rect x="1220" y="340" width="190" height="80" rx="8" fill="none" stroke="var(--line)" stroke-width="1.2" stroke-dasharray="3 4"/>
+        <text x="1315" y="364" text-anchor="middle" font-family="var(--mono)" font-size="10" fill="var(--text-dim)">commit barrier</text>
+        <text x="1315" y="380" text-anchor="middle" font-family="var(--sans)" font-size="9.5" fill="var(--text-dim)">an ecall at any head</text>
+        <text x="1315" y="393" text-anchor="middle" font-family="var(--sans)" font-size="9.5" fill="var(--text-dim)">position blocks every</text>
+        <text x="1315" y="406" text-anchor="middle" font-family="var(--sans)" font-size="9.5" fill="var(--text-dim)">younger same-cycle commit</text>
+        <line x1="1315" y1="310" x2="1315" y2="338" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2 3"/>
+      </svg>
+    </div>
+
+    <div class="legend">
+      <span><span class="swatch" style="background:currentColor"></span>program data / control</span>
+      <span><span class="swatch" style="background:var(--accent)"></span>common data bus + misprediction path</span>
+      <span><span class="swatch" style="background:var(--line-strong);border-top:1px dashed var(--line-strong);height:0"></span>side-band (alloc / commit-clear)</span>
+    </div>
+  </section>
+
+  <div class="two-col">
+    <div class="sidebox">
+      <h3>What the CDB diagram hides on purpose</h3>
+      <ul>
+        <li>Age is <code>tag − rob_head_tag</code> under unsigned wraparound, not raw tag magnitude — the head, if requesting, always wins.</li>
+        <li>A resolved branch and a ready store never touch the CDB — they use <code>rob.v</code>'s unarbitrated <code>mark2</code> / <code>extra_mark</code> ports instead, since neither has a value to broadcast.</li>
+        <li>SMT doubles most of this figure per-thread (front end, ROB, RAT, branch_rs); the RS banks, LSQ and CDB are shared and tag every entry with <code>tid</code>.</li>
+      </ul>
+    </div>
+    <div class="sidebox">
+      <h3>What Fig. 1 leaves out on purpose</h3>
+      <ul>
+        <li>SECDED ECC on the register file, L1, L2 and ROB payload — a correctness layer orthogonal to the dataflow shown here.</li>
+        <li>Hardware next-line prefetch, hit-under-miss, and the merging write buffer inside <code>l1_cache.v</code>.</li>
+        <li>The RVV vector datapath (<code>vec_rs.v</code> / <code>vec_rat.v</code>), thread-0-only, broadcasting on its own dedicated ROB port.</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>
+    <span>RV64I_OOO — Tomasulo + ROB, RV64I+M, no A/C/F/D/V</span>
+    <span>generated from README.md, phases 1–17</span>
+  </footer>
+
+</div>
